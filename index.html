@@ -1,0 +1,344 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Portal de Publicações — Gramado Parks</title>
+    <meta name="description" content="Portal interno de conferência de publicações jurídicas da Gramado Parks. Monitore intimações, despachos e sentenças do Intelivix.">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="style.css">
+    <!-- Lucide Icons -->
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <!-- SheetJS for Excel export (CDN confiável) -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+</head>
+<body>
+    <div class="app-container">
+        <!-- Header -->
+        <header class="header" id="app-header">
+            <div class="logo-area">
+                <img src="logo.png" alt="Logo Gramado Parks" id="company-logo" onerror="this.onerror=null; this.src=''; this.alt='GP';">
+                <div class="logo-text">
+                    <h1>Portal de Publicações</h1>
+                    <span>Jurídico Gramado Parks</span>
+                </div>
+            </div>
+            <div class="header-right" style="display: flex; align-items: center; gap: 10px;">
+                <button class="header-action-btn" onclick="toggleHistoryPanel()" title="Histórico de Envios">
+                    <i data-lucide="clock"></i> Histórico
+                </button>
+                <button class="header-action-btn primary-btn" onclick="renderMailbox()" style="position: relative;">
+                    <i data-lucide="inbox"></i> Fila de E-mails
+                    <span id="mailbox-badge" style="display:none; position: absolute; top: -8px; right: -8px; background: #ef4444; color: white; width: 22px; height: 22px; border-radius: 50%; font-size: 11px; align-items: center; justify-content: center; font-weight: 700;">0</span>
+                </button>
+                <div class="sync-status" id="sync-status">
+                    <i data-lucide="wifi" class="sync-icon"></i>
+                    <span>Conectado</span>
+                </div>
+            </div>
+        </header>
+
+        <!-- Summary Cards (Moved to top) -->
+        <section class="summary-cards" id="summary-cards">
+            <div class="card card-total card-clickable" id="card-total" onclick="filterByCard('todos')">
+                <div class="card-icon"><i data-lucide="inbox"></i></div>
+                <div class="card-info">
+                    <h3>Total</h3>
+                    <p class="number" id="count-total">0</p>
+                </div>
+            </div>
+            <div class="card card-unread card-clickable" id="card-unread" onclick="filterByCard('nao_lido')">
+                <div class="card-icon icon-unread"><i data-lucide="mail"></i></div>
+                <div class="card-info">
+                    <h3>Não Lidas</h3>
+                    <p class="number" id="count-unread">0</p>
+                </div>
+            </div>
+            <div class="card card-read card-clickable" id="card-read" onclick="filterByCard('lido')">
+                <div class="card-icon icon-read"><i data-lucide="mail-check"></i></div>
+                <div class="card-info">
+                    <h3>Lidas</h3>
+                    <p class="number" id="count-read">0</p>
+                </div>
+            </div>
+            <div class="card card-new card-clickable" id="card-new" onclick="filterByCard('novo')">
+                <div class="card-icon icon-new"><i data-lucide="sparkles"></i></div>
+                <div class="card-info">
+                    <h3>Novas</h3>
+                    <p class="number" id="count-new">0</p>
+                </div>
+            </div>
+        </section>
+
+        <!-- Filter Bar -->
+        <section class="filter-bar" id="filter-bar">
+            <!-- Row 1: Core Filters -->
+            <div class="filter-row">
+                <!-- Status Filter -->
+            <div class="filter-group">
+                <label><i data-lucide="filter"></i> Status</label>
+                <div class="filter-buttons" id="status-filter">
+                    <button class="fbtn active" data-status="todos">Todos</button>
+                    <button class="fbtn" data-status="nao_lido">
+                        <span class="dot dot-unread"></span> Não Lidas
+                    </button>
+                    <button class="fbtn" data-status="lido">
+                        <span class="dot dot-read"></span> Lidas
+                    </button>
+                    <button class="fbtn" data-status="desconsiderado">
+                        <span class="dot dot-desc"></span> Lixeira
+                    </button>
+                </div>
+            </div>
+
+            <!-- Area Filter (Dropdown) -->
+            <div class="filter-group">
+                <label><i data-lucide="briefcase"></i> Área</label>
+                <div class="dropdown-wrapper">
+                    <button class="dropdown-btn" onclick="toggleDropdown('area-dropdown-container')">
+                        <span id="area-btn-label">Todas</span>
+                        <i data-lucide="chevron-down"></i>
+                    </button>
+                    <div class="dropdown-content hidden" id="area-dropdown-container" style="min-width: 200px; max-height: 200px;">
+                        <div class="dropdown-list" id="area-dropdown">
+                            <label class="dropdown-item area-opt active-area" onclick="setAreaFilter('todos')">
+                                <span style="width:18px;height:18px;border-radius:4px;background:#e2e8f0;display:flex;align-items:center;justify-content:center;font-size:0.65rem;font-weight:800;color:#64748b;">✓</span> Todas as Áreas
+                            </label>
+                            <label class="dropdown-item area-opt" onclick="setAreaFilter('civel')">
+                                <span class="chip-civel-sm">C</span> Cível
+                            </label>
+                            <label class="dropdown-item area-opt" onclick="setAreaFilter('trabalhista')">
+                                <span class="chip-trab-sm">T</span> Trabalhista
+                            </label>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Data Filter -->
+            <div class="filter-group">
+                <label><i data-lucide="building"></i> Empreendimentos</label>
+                <div class="dropdown-wrapper">
+                    <button class="dropdown-btn" onclick="toggleDropdown('emp-dropdown-container')">
+                        <span id="emp-btn-label">Todos</span>
+                        <i data-lucide="chevron-down"></i>
+                    </button>
+                    <div class="dropdown-content hidden" id="emp-dropdown-container">
+                        <div class="dropdown-toolbar">
+                            <input type="text" id="emp-search-input" placeholder="Pesquisar..." oninput="filterEmpDropdown()" class="dropdown-search">
+                            <button class="dropdown-clear-btn" onclick="clearEmpFilter()">Limpar</button>
+                        </div>
+                        <div id="emp-dropdown" class="dropdown-list">
+                            <label class="dropdown-item">Carregando...</label>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Advogado Filter -->
+            <div class="filter-group">
+                <label><i data-lucide="user"></i> Advogados</label>
+                <div class="dropdown-wrapper">
+                    <button class="dropdown-btn" onclick="toggleDropdown('adv-dropdown-container')">
+                        <span id="adv-btn-label">Todos</span>
+                        <i data-lucide="chevron-down"></i>
+                    </button>
+                    <div class="dropdown-content hidden" id="adv-dropdown-container">
+                        <div class="dropdown-toolbar">
+                            <button class="dropdown-clear-btn" onclick="clearAdvFilter()" style="margin-left:auto;">Limpar</button>
+                        </div>
+                        <div id="adv-dropdown" class="dropdown-list">
+                            <!-- Populated via JS -->
+                            <label class="dropdown-item">Carregando...</label>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Date Range Filter -->
+            <div class="filter-group">
+                <label><i data-lucide="calendar-range"></i> Período</label>
+                <div class="date-range-wrapper">
+                    <div class="date-input-box" id="date-start-box">
+                        <span id="date-start-label">Data Inicial</span>
+                        <i data-lucide="calendar" class="cal-icon"></i>
+                    </div>
+                    <span class="date-sep">até</span>
+                    <div class="date-input-box" id="date-end-box">
+                        <span id="date-end-label">Data Final</span>
+                        <i data-lucide="calendar" class="cal-icon"></i>
+                    </div>
+                    <button class="clear-dates-btn" id="clear-dates-btn" title="Limpar datas">
+                        <i data-lucide="x"></i>
+                    </button>
+                </div>
+            </div>
+
+            </div> <!-- End Row 1 -->
+
+            <!-- Row 2: Secondary Filters & Table Controls -->
+            <div class="filter-row secondary-row">
+                <!-- CNJ Search -->
+            <div class="filter-group">
+                <label><i data-lucide="search"></i> Buscar CNJ</label>
+                <input type="text" id="cnj-search-input" placeholder="Ex: 7000" class="cnj-search-input" oninput="filters.cnjSearch = this.value.trim(); applyFilters();">
+            </div>
+
+            <!-- Per Page -->
+            <div class="filter-group">
+                <label><i data-lucide="rows-3"></i> Exibir</label>
+                <select id="per-page-select" class="per-page-select">
+                    <option value="25">25 por página</option>
+                    <option value="50">50 por página</option>
+                    <option value="100">100 por página</option>
+                    <option value="200">200 por página</option>
+                    <option value="500">500 por página</option>
+                    <option value="all">Todas</option>
+                </select>
+            </div>
+
+            <!-- Export Button -->
+            <div class="filter-group ml-auto">
+                <button class="action-btn btn-export" onclick="downloadReport()" title="Baixar relatório em formato CSV com os filtros atuais">
+                    <i data-lucide="download"></i> Exportar
+                </button>
+            </div>
+            </div> <!-- End Row 2 -->
+        </section>
+
+        <!-- Bulk Action Bar -->
+        <section class="bulk-action-bar hidden" id="bulk-action-bar">
+            <span><strong id="bulk-count">0</strong> publicações selecionadas</span>
+            <div class="bulk-actions">
+                <button class="action-btn btn-mark-read" onclick="bulkMarkAs(true)">
+                    <i data-lucide="check-square"></i> Marcar Lidas
+                </button>
+                <button class="action-btn btn-mark-unread" onclick="bulkMarkAs(false)">
+                    <i data-lucide="square"></i> Marcar Não Lidas
+                </button>
+                <button class="bulk-cancel-btn" onclick="clearBulkSelection()">Cancelar</button>
+            </div>
+        </section>
+
+        <!-- Publications Table -->
+        <section class="table-section" id="table-section">
+            <div class="table-header">
+                <h2>
+                    <i data-lucide="scroll-text"></i> Publicações
+                    <span class="table-count" id="table-count"></span>
+                </h2>
+                <div class="table-actions">
+                    <div class="pagination" id="pagination">
+                        <span class="page-info" id="page-info">–</span>
+                        <button class="page-btn" id="prev-page" disabled><i data-lucide="chevron-left"></i></button>
+                        <button class="page-btn" id="next-page" disabled><i data-lucide="chevron-right"></i></button>
+                    </div>
+                </div>
+            </div>
+
+            <div class="table-container">
+                <table class="pub-table" id="pub-table">
+                    <thead>
+                        <tr>
+                            <th class="th-checkbox"><input type="checkbox" id="select-all-cb" onclick="toggleSelectAll()"></th>
+                            <th class="th-status th-sortable" onclick="sortBy('status')" id="th-status">Status <span class="sort-arrow" id="sort-arrow-status"></span></th>
+                            <th class="th-data th-sortable" onclick="sortBy('data')" id="th-data">Disponibilização <span class="sort-arrow" id="sort-arrow-data">▼</span></th>
+                            <th class="th-area">Área</th>
+                            <th class="th-processo">Processo (CNJ)</th>
+                            <th class="th-tipo">Tipo Publicação</th>
+                            <th class="th-orgao">Órgão Expedidor</th>
+                            <th class="th-acoes">Ações</th>
+                        </tr>
+                    </thead>
+                    <tbody id="pub-table-body">
+                        <tr>
+                            <td colspan="7" class="empty-state">
+                                <div class="empty-content">
+                                    <div class="spinner"></div>
+                                    <p>Carregando publicações...</p>
+                                </div>
+                            </td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+
+            <!-- Bottom Pagination -->
+            <div class="table-footer">
+                <div class="pagination" id="pagination-bottom">
+                    <span class="page-info" id="page-info-bottom">–</span>
+                    <button class="page-btn" id="prev-page-bottom" disabled><i data-lucide="chevron-left"></i></button>
+                    <button class="page-btn" id="next-page-bottom" disabled><i data-lucide="chevron-right"></i></button>
+                </div>
+            </div>
+        </section>
+    </div>
+
+    <!-- Date Picker Modal -->
+    <div class="datepicker-overlay hidden" id="datepicker-overlay">
+        <div class="datepicker-modal">
+            <div class="datepicker-header">
+                <button class="dp-nav-btn" id="dp-prev"><i data-lucide="chevron-left"></i></button>
+                <h3 id="dp-title">Abril 2026</h3>
+                <button class="dp-nav-btn" id="dp-next"><i data-lucide="chevron-right"></i></button>
+            </div>
+            <div class="datepicker-weekdays">
+                <span>Dom</span><span>Seg</span><span>Ter</span><span>Qua</span><span>Qui</span><span>Sex</span><span>Sáb</span>
+            </div>
+            <div class="datepicker-grid" id="dp-grid"></div>
+            <div class="datepicker-footer">
+                <button class="dp-cancel-btn" id="dp-cancel">Cancelar</button>
+                <button class="dp-today-btn" id="dp-today">Hoje</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Detail Modal removido — detalhes agora abrem inline como accordion -->
+
+    <!-- Loading Overlay -->
+    <div class="loading-overlay hidden" id="loading-overlay">
+        <div class="spinner-lg"></div>
+        <p>Sincronizando com a planilha...</p>
+    </div>
+
+    <!-- Modal Caixa de Saída / Fila (REDESENHADO) -->
+    <div class="overlay hidden" id="mailbox-modal" onclick="if(event.target===this) closeMailbox()">
+        <div class="mailbox-modal-container">
+            <div class="mailbox-header">
+                <div class="mailbox-header-left">
+                    <i data-lucide="send" style="width:20px;height:20px;"></i>
+                    <h2>Fila de Disparo de E-mails</h2>
+                    <span class="mailbox-count-badge" id="mailbox-count-header">0</span>
+                </div>
+                <div class="mailbox-header-right">
+                    <button class="mailbox-send-all-btn" id="send-all-btn" onclick="flushAllMailbox()">
+                        <i data-lucide="send"></i> Enviar Todos
+                    </button>
+                    <button class="mailbox-close-btn" onclick="closeMailbox()"><i data-lucide="x"></i></button>
+                </div>
+            </div>
+            <div class="mailbox-body" id="mailbox-container">
+                <!-- Itens renderizados aqui -->
+            </div>
+        </div>
+    </div>
+
+    <!-- Painel Lateral de Histórico -->
+    <div class="history-panel hidden" id="history-panel">
+        <div class="history-header">
+            <div style="display:flex;align-items:center;gap:10px;">
+                <i data-lucide="clock" style="width:20px;height:20px;color:var(--gold);"></i>
+                <h2>Histórico de Envios</h2>
+            </div>
+            <button class="mailbox-close-btn" onclick="toggleHistoryPanel()"><i data-lucide="x"></i></button>
+        </div>
+        <div class="history-body" id="history-container">
+            <!-- Histórico renderizado aqui -->
+        </div>
+    </div>
+    <div class="history-overlay hidden" id="history-overlay" onclick="toggleHistoryPanel()"></div>
+
+    <script src="script.js?v=4"></script>
+    <script>lucide.createIcons();</script>
+</body>
+</html>
