@@ -12,7 +12,7 @@ const CONFIG = {
     SHEET_ID: '1qwX3VE34d0C6lD68x00Jj09Un9Rnwh2qOninaOA9Bww',
     SHEET_GID: '1744303682',
     PER_PAGE_DEFAULT: 25,
-    REFRESH_INTERVAL: 30 * 1000, // 30 segundos — sincronização quase em tempo real
+    REFRESH_INTERVAL: 60 * 1000, // 60 segundos — menos interrupções ao trabalhar
 };
 
 // ─────────── MAPEAMENTO DE TRIBUNAIS ───────────
@@ -92,6 +92,7 @@ let datepickerTarget = null;
 let datepickerMonth = new Date().getMonth();
 let datepickerYear = new Date().getFullYear();
 let expandedUid = null;
+let selectedRowUid = null;
 let sortColumn = 'data';
 let sortDirection = 'desc';
 let statusCache = {};
@@ -101,20 +102,35 @@ try { knownCnjs = new Set(JSON.parse(localStorage.getItem('foreigor_known_cnjs')
 // Delegation log — persists across page reloads (fallback when Sheets is slow)
 let delegationLog = {};
 try { delegationLog = JSON.parse(localStorage.getItem('foreigor_delegation_log')) || {}; } catch(e) { delegationLog = {}; }
-// Optimistic updates: alterações locais recentes que ainda não foram confirmadas pelo servidor.
-// TTL curto: apenas 3 segundos de feedback visual imediato. Depois, a PLANILHA VENCE SEMPRE.
-const OPTIMISTIC_TTL_MS = 3000;
+// Optimistic updates: alterações locais que permanecem até a confirmação pelo servidor.
 let optimisticUpdates = {};
 try { optimisticUpdates = JSON.parse(localStorage.getItem('foreigor_optimistic_updates')) || {}; } catch(e) { optimisticUpdates = {}; }
 
+// ─── LOCKED STATUSES — "Cimento e Concreto" ───
+// Publicações tratadas ficam TRAVADAS aqui. Uma vez marcada como LIDO ou DESCONSIDERADO,
+// a publicação nunca volta a ser NÃO LIDO automaticamente — só se o usuário desmarcar manualmente.
+// Estrutura: { [_uid]: { status, cnj, lockedAt } }
+let lockedStatuses = {};
+try { lockedStatuses = JSON.parse(localStorage.getItem('foreigor_locked_statuses')) || {}; } catch(e) { lockedStatuses = {}; }
+
 // Fila de Sincronização em Lote (Batch Sync)
 let syncQueue = [];
+try { syncQueue = JSON.parse(localStorage.getItem('foreigor_sync_queue')) || []; } catch(e) { syncQueue = []; }
 let isSyncing = false;
+
+function saveSyncQueue() {
+    try { localStorage.setItem('foreigor_sync_queue', JSON.stringify(syncQueue)); } catch(e) {}
+}
+
+function saveLockedStatuses() {
+    try { localStorage.setItem('foreigor_locked_statuses', JSON.stringify(lockedStatuses)); } catch(e) {}
+}
 
 // ─────────── INIT ───────────
 document.addEventListener('DOMContentLoaded', () => {
     loadStatusCache();
     setupEventListeners();
+    injectConfirmModal();
     fetchPublications();
     // Auto-refresh da planilha (Google Sheets é a única fonte da verdade)
     setInterval(fetchPublications, CONFIG.REFRESH_INTERVAL);
@@ -122,14 +138,55 @@ document.addEventListener('DOMContentLoaded', () => {
     setInterval(processSyncQueue, 3000);
 });
 
+// ─── Detecta se o usuário está digitando em algum campo do accordion ───
+function isUserEditing() {
+    const el = document.activeElement;
+    if (!el) return false;
+    const tag = el.tagName.toLowerCase();
+    return (tag === 'textarea' || tag === 'input') && !!el.closest('.detail-row, .delegation-box, .mbox-subject-row');
+}
+
+// ─── Modal de confirmação (caixinha no canto inferior) ───
+let _confirmCallback = null;
+function injectConfirmModal() {
+    const div = document.createElement('div');
+    div.id = 'confirm-read-modal';
+    div.style.cssText = 'display:none;position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:#1e293b;color:#f8fafc;padding:16px 24px;border-radius:12px;box-shadow:0 8px 32px rgba(0,0,0,.4);z-index:9999;display:none;align-items:center;gap:16px;font-family:Inter,sans-serif;font-size:.9rem;min-width:320px;';
+    div.innerHTML = `
+        <span id="confirm-read-msg" style="flex:1">Tem certeza que quer marcar como <strong>Lida</strong>?</span>
+        <button onclick="document.getElementById('confirm-read-modal').style.display='none';_confirmCallback=null;" style="background:#475569;color:#fff;border:none;padding:7px 14px;border-radius:7px;cursor:pointer;font-size:.85rem;">Cancelar</button>
+        <button onclick="if(_confirmCallback){_confirmCallback();_confirmCallback=null;}document.getElementById('confirm-read-modal').style.display='none';" style="background:#10b981;color:#fff;border:none;padding:7px 14px;border-radius:7px;cursor:pointer;font-size:.85rem;font-weight:700;">✓ Sim</button>
+    `;
+    document.body.appendChild(div);
+}
+function askConfirmRead(msg, callback) {
+    const modal = document.getElementById('confirm-read-modal');
+    if (!modal) { callback(); return; }
+    document.getElementById('confirm-read-msg').innerHTML = msg;
+    _confirmCallback = callback;
+    modal.style.display = 'flex';
+}
+
 // ─────────── FETCH DATA ───────────
 async function fetchPublications() {
+    // Se o usuário está digitando, atualiza os dados mas NÃO re-renderiza
+    // para não apagar o que ele está escrevendo
+    if (isUserEditing()) {
+        try {
+            const cacheBust = `?t=${Date.now()}`;
+            const response = await fetch(CONFIG.APPS_SCRIPT_URL + cacheBust);
+            const data = await response.json();
+            allPublications = data.map(normalizePublication);
+            detectNewPublications();
+            setSyncStatus('ok', 'Conectado (modo edição)');
+        } catch(e) { /* silencioso */ }
+        return;
+    }
+
     setSyncStatus('loading', 'Sincronizando...');
 
     try {
-        // Tentar Apps Script primeiro (se configurado)
         if (CONFIG.APPS_SCRIPT_URL) {
-            // Cache-busting: força o Apps Script a não servir resposta em cache
             const cacheBust = `?t=${Date.now()}`;
             const response = await fetch(CONFIG.APPS_SCRIPT_URL + cacheBust);
             const data = await response.json();
@@ -138,12 +195,8 @@ async function fetchPublications() {
             allPublications = await fetchViaGoogleViz();
         }
 
-        // Carregar fila de e-mails da planilha (multiusuário)
         loadEmailQueueFromSheets();
-
-        // Mark new publications
         detectNewPublications();
-
         applyFilters();
         populateFilterDropdowns();
         updateCounters();
@@ -151,21 +204,15 @@ async function fetchPublications() {
     } catch (err) {
         console.error('Erro ao buscar publicações:', err);
         setSyncStatus('error', 'Sem internet / ' + (err.message || 'Erro desconhecido'));
-
-        // Show error in table if empty
         if (allPublications.length === 0) {
             document.getElementById('pub-table-body').innerHTML = `
-                <tr>
-                    <td colspan="7" class="empty-state">
-                        <div class="empty-content">
-                            <i data-lucide="wifi-off" style="width:40px;height:40px;color:var(--danger);"></i>
-                            <p>Erro ao carregar publicações. Verifique sua conexão.</p>
-                            <button onclick="fetchPublications()" class="action-btn btn-mark-read" style="margin-top:8px;">
-                                <i data-lucide="refresh-cw"></i> Tentar novamente
-                            </button>
-                        </div>
-                    </td>
-                </tr>`;
+                <tr><td colspan="7" class="empty-state"><div class="empty-content">
+                    <i data-lucide="wifi-off" style="width:40px;height:40px;color:var(--danger);"></i>
+                    <p>Erro ao carregar publicações. Verifique sua conexão.</p>
+                    <button onclick="fetchPublications()" class="action-btn btn-mark-read" style="margin-top:8px;">
+                        <i data-lucide="refresh-cw"></i> Tentar novamente
+                    </button>
+                </div></td></tr>`;
             lucide.createIcons();
         }
     }
@@ -386,28 +433,44 @@ async function fetchViaGoogleViz() {
         const cnjStr = String(cnj).trim();
         if (!/\d{7}-\d{2}\.\d{4}\.\d\.\d{2}\.\d{4}/.test(cnjStr)) continue;
 
-        // Status precedence (Sheets-First — PLANILHA É A ÚNICA FONTE DA VERDADE):
-        //   1. Se há um optimistic update recente (<3s) → feedback visual imediato
-        //   2. Após 3 segundos (ou após sync confirmado): PLANILHA VENCE SEMPRE
         const cnjStr2 = String(cnj).trim();
-        const optimistic = optimisticUpdates[cnjStr2];
-        const hasRecentOptimistic = optimistic && (Date.now() - optimistic.timestamp) < OPTIMISTIC_TTL_MS;
+        
+        // UID DETERMINÍSTICO: idPub + CNJ + hash do teor
+        // Isso garante que o UID seja idêntico entre reloads e sincronizações
+        const _teorHash = String(textoPub || '').length;
+        const _uid = `${idPub || 'noid'}_${cnjStr2}_${_teorHash}`;
+
+        // Status precedence: Locked > Optimistic > Planilha
         let rawStatus = String(statusSpreadsheet).trim().toUpperCase();
         let finalStatus;
-        if (hasRecentOptimistic) {
-            // Optimistic update muito recente (< 3s): feedback visual imediato
-            finalStatus = optimistic.status;
-        } else {
-            // Planilha é a verdade — limpar qualquer optimistic expirado
-            if (optimistic) { delete optimisticUpdates[cnjStr2]; saveOptimisticUpdates(); }
+
+        // 1. LOCKED (cimento e concreto): status travado pelo usuário — imutável até desmarcar manualmente
+        if (lockedStatuses[_uid]) {
+            finalStatus = lockedStatuses[_uid].status;
+        }
+        // 2. OPTIMISTIC: mudança local ainda não confirmada pelo servidor
+        else if (optimisticUpdates[_uid] || optimisticUpdates[cnjStr2]) {
+            finalStatus = (optimisticUpdates[_uid] || optimisticUpdates[cnjStr2]).status;
+        }
+        // 3. PLANILHA: fonte da verdade remota
+        else {
             if (rawStatus === 'LIDO' || rawStatus === 'LIDA') {
                 finalStatus = 'LIDO';
-            } else if (rawStatus === 'NÃO LIDO' || rawStatus === 'NAO LIDO' || rawStatus === 'NÃO LIDA' || rawStatus === 'NAO LIDA') {
-                finalStatus = 'NÃO LIDO';
+                // Auto-travar: planilha confirmou LIDO → proteger localmente
+                if (!lockedStatuses[_uid]) {
+                    lockedStatuses[_uid] = { status: 'LIDO', cnj: cnjStr2, lockedAt: Date.now() };
+                    saveLockedStatuses();
+                }
             } else if (rawStatus === 'DESCONSIDERADO' || rawStatus === 'IGNORADO') {
                 finalStatus = 'DESCONSIDERADO';
+                // Auto-travar: planilha confirmou DESCONSIDERADO → proteger localmente
+                if (!lockedStatuses[_uid]) {
+                    lockedStatuses[_uid] = { status: 'DESCONSIDERADO', cnj: cnjStr2, lockedAt: Date.now() };
+                    saveLockedStatuses();
+                }
+            } else if (rawStatus === 'NÃO LIDO' || rawStatus === 'NAO LIDO' || rawStatus === 'NÃO LIDA' || rawStatus === 'NAO LIDA') {
+                finalStatus = 'NÃO LIDO';
             } else {
-                // Planilha vazia/inválida: padrão seguro
                 finalStatus = 'NÃO LIDO';
             }
         }
@@ -415,11 +478,6 @@ async function fetchViaGoogleViz() {
         // Órgão Expedidor: usar da planilha ou detectar automaticamente pelo CNJ
         const detectedTribunal = detectTribunal(cnj);
         const orgaoFinal = orgao || (detectedTribunal ? detectedTribunal.nome : '');
-
-        // UID DETERMINÍSTICO: combina idPub + CNJ + índice da lista
-        // NÃO usar Math.random() — o UID precisa ser idêntico entre renderizações
-        // para que o onclick do botão encontre o objeto correto no array allPublications
-        const _uid = `${idPub || 'noid'}_${cnjStr}_${publications.length}`;
         publications.push({
             _uid: _uid,
             dataDisponibilizacao: dataStr, // Alias para sort actions
@@ -577,33 +635,44 @@ function normalizePublication(row) {
 
     // --- Status (Sheets-First — PLANILHA É A ÚNICA FONTE DA VERDADE) ---
     const _cnjNorm = String(cnj).trim();
-    const _optimistic = optimisticUpdates[_cnjNorm];
-    const _hasRecentOptimistic = _optimistic && (Date.now() - _optimistic.timestamp) < OPTIMISTIC_TTL_MS;
+    const idPubRaw = row['Id Publicação'] || row.idPublicacao || '';
+    const _teorHash = String(textoPub || '').length;
+    const _uid = `${idPubRaw || 'noid'}_${_cnjNorm}_${_teorHash}`;
+
+    // --- Status (Prioridade: Locked > Optimistic > Planilha) ---
     let rawStatus = String(row.Status || row.status || '').trim().toUpperCase();
     let finalStatus;
-    if (_hasRecentOptimistic) {
-        finalStatus = _optimistic.status;
-    } else {
-        // Planilha é a verdade — limpar qualquer optimistic expirado
-        if (_optimistic) { delete optimisticUpdates[_cnjNorm]; saveOptimisticUpdates(); }
+
+    // 1. LOCKED (cimento e concreto): status travado pelo usuário — imutável até desmarcar manualmente
+    if (lockedStatuses[_uid]) {
+        finalStatus = lockedStatuses[_uid].status;
+    }
+    // 2. OPTIMISTIC: mudança local ainda não confirmada pelo servidor
+    else if (optimisticUpdates[_uid] || optimisticUpdates[_cnjNorm]) {
+        finalStatus = (optimisticUpdates[_uid] || optimisticUpdates[_cnjNorm]).status;
+    }
+    // 3. PLANILHA: fonte da verdade remota
+    else {
         if (rawStatus === 'LIDO' || rawStatus === 'LIDA') {
             finalStatus = 'LIDO';
-        } else if (rawStatus === 'NÃO LIDO' || rawStatus === 'NAO LIDO' || rawStatus === 'NÃO LIDA' || rawStatus === 'NAO LIDA') {
-            finalStatus = 'NÃO LIDO';
+            // Auto-travar: planilha confirmou LIDO → proteger localmente
+            if (!lockedStatuses[_uid]) {
+                lockedStatuses[_uid] = { status: 'LIDO', cnj: _cnjNorm, lockedAt: Date.now() };
+                saveLockedStatuses();
+            }
         } else if (rawStatus === 'DESCONSIDERADO' || rawStatus === 'IGNORADO') {
             finalStatus = 'DESCONSIDERADO';
+            // Auto-travar: planilha confirmou DESCONSIDERADO → proteger localmente
+            if (!lockedStatuses[_uid]) {
+                lockedStatuses[_uid] = { status: 'DESCONSIDERADO', cnj: _cnjNorm, lockedAt: Date.now() };
+                saveLockedStatuses();
+            }
+        } else if (rawStatus === 'NÃO LIDO' || rawStatus === 'NAO LIDO' || rawStatus === 'NÃO LIDA' || rawStatus === 'NAO LIDA') {
+            finalStatus = 'NÃO LIDO';
         } else {
             finalStatus = 'NÃO LIDO';
         }
     }
-
-    const idPubRaw = row['Id Publicação'] || row.idPublicacao || '';
-    // UID DETERMINÍSTICO: combina idPub + CNJ + timestamp-menos-random para ser
-    // único por publicação mas estável entre re-renderizações.
-    // Usamos o índice implícito via closure não disponível aqui, então usamos
-    // um hash simples do teor para diferenciação quando há CNJ duplicado.
-    const _teorHash = String(textoPub || '').length;
-    const _uid = `${idPubRaw || 'noid'}_${cnj}_${_teorHash}`;
     return {
         _uid: _uid,
         dataDisponibilizacao: dataStr,
@@ -671,25 +740,42 @@ function getStatus(cnjOrUid) {
     return statusCache[cnjOrUid] || 'NÃO LIDO';
 }
 
-function setStatus(cnj, status, _uid) {
-    // 1. Optimistic update local permanente até a planilha confirmar
-    optimisticUpdates[cnj] = { status: status, timestamp: Date.now() };
+function setStatus(cnj, status, _uid, idPublicacao) {
+    const optKey = _uid || cnj;
+
+    // ── LOCKED STATUSES (cimento e concreto) ──
+    if (status === 'LIDO' || status === 'DESCONSIDERADO') {
+        // Travar: esse status nunca volta sozinho enquanto não desmarcar manualmente
+        lockedStatuses[optKey] = { status: status, cnj: cnj, lockedAt: Date.now() };
+        saveLockedStatuses();
+    } else {
+        // NÃO LIDO = usuário desmarcou manualmente → remover o travamento
+        if (lockedStatuses[optKey]) {
+            delete lockedStatuses[optKey];
+            saveLockedStatuses();
+        }
+        // Também limpar optimistic para que o próximo fetch busque da planilha
+        if (optimisticUpdates[optKey]) { delete optimisticUpdates[optKey]; saveOptimisticUpdates(); }
+    }
+
+    // 1. Optimistic: chave precisa para consistência visual imediata
+    optimisticUpdates[optKey] = { status: status, timestamp: Date.now() };
     saveOptimisticUpdates();
 
-    // 2. Também salvar no statusCache como fallback offline
+    // 2. statusCache como fallback offline
     statusCache[cnj] = status;
     if (_uid) statusCache[_uid] = status;
     saveStatusCache();
 
-    // 3. Adicionar à fila de sincronização em lote
-    const existingIdx = syncQueue.findIndex(u => u.cnj === cnj);
+    // 3. Fila de sync — inclui idPublicacao para o Apps Script achar a linha exata
+    const existingIdx = syncQueue.findIndex(u => u._uid === optKey);
     if (existingIdx !== -1) {
         syncQueue[existingIdx].status = status;
     } else {
-        syncQueue.push({ cnj: cnj, status: status, observacoes: '' });
+        syncQueue.push({ cnj: cnj, status: status, _uid: optKey, idPublicacao: idPublicacao || '', observacoes: '' });
     }
-    
-    // Tenta processar imediatamente se não estiver rodando
+
+    saveSyncQueue(); // Persiste a fila
     processSyncQueue();
 }
 
@@ -711,17 +797,24 @@ async function processSyncQueue() {
         
         if (res.ok) {
             console.log(`[Sync] ✓ Lote de ${batch.length} salvo com sucesso na planilha.`);
-            
-            // Remove da fila apenas os itens que acabaram de ser enviados
-            syncQueue = syncQueue.filter(qItem => !batch.some(bItem => bItem.cnj === qItem.cnj && bItem.status === qItem.status));
-            
-            // Limpar optimisticUpdates para os CNJs confirmados pela planilha
-            // A planilha agora é a fonte da verdade — não precisamos mais dos valores locais
+
+            // Remove da fila apenas os itens enviados
+            syncQueue = syncQueue.filter(qItem => !batch.some(bItem => bItem._uid === qItem._uid && bItem.status === qItem.status));
+            saveSyncQueue();
+
+            // Limpar optimisticUpdates pelos _uid confirmados
+            // NOTA: NÃO limpamos lockedStatuses aqui — eles ficam até o usuário desmarcar manualmente.
+            // O optimistic pode ser limpo pois a planilha já foi atualizada.
             batch.forEach(item => {
-                delete optimisticUpdates[item.cnj];
+                const key = item._uid || item.cnj;
+                // Só limpar o optimistic se o locked já protege esse item
+                // (evita janela de tempo entre limpeza do optimistic e próximo fetch)
+                if (lockedStatuses[key]) {
+                    delete optimisticUpdates[key];
+                }
             });
             saveOptimisticUpdates();
-            
+
             setSyncStatus('ok', 'Conectado');
         } else {
             console.warn(`[Sync] ✗ Resposta não-OK da planilha no lote.`);
@@ -742,6 +835,41 @@ function loadStatusCache() {
         if (cached) statusCache = JSON.parse(cached);
     } catch (e) {
         statusCache = {};
+    }
+
+    // ── MIGRAÇÃO ÚNICA: promover entradas antigas para lockedStatuses ──
+    // Executa apenas uma vez por sessão para não repetir processamento.
+    // Garante que publicações tratadas ANTES desta atualização permaneçam protegidas.
+    if (!sessionStorage.getItem('foreigor_locked_migrated')) {
+        let migrated = 0;
+        const LOCK_STATUSES = ['LIDO', 'LIDA', 'DESCONSIDERADO', 'IGNORADO'];
+
+        // 1. Migrar do statusCache (chaves antigas por CNJ ou _uid)
+        for (const key in statusCache) {
+            const st = String(statusCache[key] || '').trim().toUpperCase();
+            if (LOCK_STATUSES.includes(st) && !lockedStatuses[key]) {
+                const normalized = (st === 'LIDA') ? 'LIDO' : (st === 'IGNORADO') ? 'DESCONSIDERADO' : st;
+                lockedStatuses[key] = { status: normalized, cnj: key, lockedAt: Date.now() };
+                migrated++;
+            }
+        }
+
+        // 2. Migrar do optimisticUpdates (chaves por _uid)
+        for (const key in optimisticUpdates) {
+            const entry = optimisticUpdates[key];
+            const st = String(entry && entry.status || '').trim().toUpperCase();
+            if (LOCK_STATUSES.includes(st) && !lockedStatuses[key]) {
+                const normalized = (st === 'LIDA') ? 'LIDO' : (st === 'IGNORADO') ? 'DESCONSIDERADO' : st;
+                lockedStatuses[key] = { status: normalized, cnj: key, lockedAt: Date.now() };
+                migrated++;
+            }
+        }
+
+        if (migrated > 0) {
+            saveLockedStatuses();
+            console.log(`[ForeIgor] Migração: ${migrated} status travados com sucesso.`);
+        }
+        sessionStorage.setItem('foreigor_locked_migrated', '1');
     }
 }
 
@@ -1004,9 +1132,11 @@ function renderTable() {
         const isExpanded = expandedUid === pub._uid;
         const isChecked = selectedPublications.has(pub._uid);
         const newDot = pub.isNew ? '<span class="new-dot" title="Nova"></span>' : '';
-        
-        if (isChecked) html += `<tr class="pub-row ${rowClass} selected" onclick="toggleDetailRow('${escapeHtml(pub._uid)}')">`;
-        else html += `<tr class="pub-row ${rowClass}" onclick="toggleDetailRow('${escapeHtml(pub._uid)}')">`;
+        // Borda preta na linha selecionada (mesmo que a caixa esteja fechada)
+        const isSelectedBorder = selectedRowUid === pub._uid;
+        const expandedStyle = isSelectedBorder ? ' style="outline:2.5px solid #1e293b;outline-offset:-1px;"' : '';
+        const selectedClass = isChecked ? ' selected' : '';
+        html += `<tr class="pub-row ${rowClass}${selectedClass}"${expandedStyle} onclick="toggleDetailRow('${escapeHtml(pub._uid)}')">`;
 
         const areaChip = pub.area === 'civel'
             ? '<span class="area-chip chip-civel">Cível</span>'
@@ -1040,7 +1170,9 @@ function renderTable() {
             </td>
             <td><strong>${escapeHtml(pub.dataStr)}</strong></td>
             <td>${areaChip}</td>
-            <td class="cnj-cell"><span class="processo-number">${escapeHtml(pub.cnj)}</span></td>
+            <td class="cnj-cell" onclick="event.stopPropagation();" title="Clique para copiar">
+                <span class="processo-number" style="cursor:pointer;" onclick="copyCNJ(event,'${escapeHtml(pub.cnj)}')">${escapeHtml(pub.cnj)}</span>
+            </td>
             <td><span class="tipo-text">${escapeHtml(pub.tipoPublicacao)}</span></td>
             <td><span class="orgao-text" title="${escapeHtml(pub.orgaoExpedidor)}">${escapeHtml(pub.orgaoExpedidor)}</span></td>
             <td class="actions-cell">
@@ -1319,6 +1451,7 @@ function renderAccordionRow(pub) {
 }
 
 function toggleDetailRow(_uid) {
+    selectedRowUid = _uid; // Define esta linha como a selecionada (borda)
     if (expandedUid === _uid) {
         expandedUid = null; // Fechar se já está aberto
     } else {
@@ -1392,62 +1525,88 @@ function setSyncStatus(type, text) {
 
 // ─────────── STATUS ACTIONS (TABELA & INLINE) ───────────
 
+// Copia CNJ para a área de transferência
+function copyCNJ(event, cnj) {
+    event.stopPropagation();
+    navigator.clipboard.writeText(cnj).then(() => {
+        showToast(`CNJ copiado: ${cnj}`, 'success');
+    }).catch(() => {
+        // Fallback para navegadores sem clipboard API
+        const ta = document.createElement('textarea');
+        ta.value = cnj; ta.style.position='fixed'; ta.style.opacity='0';
+        document.body.appendChild(ta); ta.select();
+        document.execCommand('copy');
+        document.body.removeChild(ta);
+        showToast(`CNJ copiado!`, 'success');
+    });
+}
+
 /**
- * toggleStatus - Alterna o status entre LIDO e NÃO LIDO para uma publicação (UID)
+ * toggleStatus - Alterna o status entre LIDO e NÃO LIDO (com confirmação ao marcar como Lida)
  */
 function toggleStatus(_uid) {
-    console.log(`[Status] Toggling status for UID: ${_uid}`);
     const pub = allPublications.find(p => p._uid === _uid);
-    if (!pub) {
-        console.warn(`[Status] Publicação com UID "${_uid}" não encontrada entre ${allPublications.length} publicações.`);
-        return;
-    }
-    
-    // Toggle simples entre LIDO e NÃO LIDO
+    if (!pub) return;
     const next = pub.status === 'LIDO' ? 'NÃO LIDO' : 'LIDO';
-    pub.status = next;
-    
-    // Persistir usando CNJ + UID
-    setStatus(pub.cnj, next, pub._uid);
-    
-    // Refresh UI (applyFilters já chama renderTable e updateCounters internamente)
-    applyFilters();
+    if (next === 'LIDO') {
+        askConfirmRead('Tem certeza que quer marcar como <strong>Lida</strong>?', () => {
+            pub.status = next;
+            setStatus(pub.cnj, next, pub._uid, pub.idPublicacao);
+            selectedRowUid = _uid;
+            applyFilters();
+        });
+    } else {
+        pub.status = next;
+        setStatus(pub.cnj, next, pub._uid, pub.idPublicacao);
+        selectedRowUid = _uid;
+        applyFilters();
+    }
 }
 
 /**
  * toggleStatusInline - Chamado para alternar status e fechar a linha
  */
 function toggleStatusInline(_uid) {
-    console.log(`[Status] Toggling inline for UID: ${_uid}`);
     const pub = allPublications.find(p => p._uid === _uid);
-    if (!pub) {
-        console.warn(`[Status] Publicação com UID "${_uid}" não encontrada.`);
-        return;
-    }
-    
+    if (!pub) return;
     const next = pub.status === 'LIDO' ? 'NÃO LIDO' : 'LIDO';
-    pub.status = next;
-    setStatus(pub.cnj, next, pub._uid);
-    
-    expandedUid = null;
-    applyFilters();
+    if (next === 'LIDO') {
+        askConfirmRead('Tem certeza que quer marcar como <strong>Lida</strong>?', () => {
+            pub.status = next;
+            setStatus(pub.cnj, next, pub._uid, pub.idPublicacao);
+            expandedUid = null;
+            selectedRowUid = _uid;
+            applyFilters();
+        });
+    } else {
+        pub.status = next;
+        setStatus(pub.cnj, next, pub._uid, pub.idPublicacao);
+        expandedUid = null;
+        selectedRowUid = _uid;
+        applyFilters();
+    }
 }
 
 /**
  * markStatusInline - Atualiza status específico e fecha linha
  */
 function markStatusInline(_uid, newStatus) {
-    console.log(`[Status] Setting status "${newStatus}" for UID: ${_uid}`);
     const pub = allPublications.find(p => p._uid === _uid);
-    if (!pub) {
-        console.warn(`[Status] Publicação com UID "${_uid}" não encontrada.`);
+    if (!pub) return;
+    if (newStatus === 'LIDO') {
+        askConfirmRead('Tem certeza que quer marcar como <strong>Lida</strong>?', () => {
+            pub.status = newStatus;
+            setStatus(pub.cnj, newStatus, pub._uid, pub.idPublicacao);
+            expandedUid = null;
+            selectedRowUid = _uid;
+            applyFilters();
+        });
         return;
     }
-    
     pub.status = newStatus;
-    setStatus(pub.cnj, newStatus, pub._uid);
-    
+    setStatus(pub.cnj, newStatus, pub._uid, pub.idPublicacao);
     expandedUid = null;
+    selectedRowUid = _uid;
     applyFilters();
 }
 
@@ -1778,27 +1937,9 @@ function addToDelegationQueue(btn, _uid) {
         }
     });
 
-    // Marcar como lida e salvar observação (delegado para...)
-    pub.status = "LIDO";
-    pub.observacoes = `Delegado para ${addedNames.join(', ')}${obs ? ': ' + obs : ''}`;
-    setStatus(pub.cnj, "LIDO");
-    
-    // Salvar no log local para persistência
+    // NÃO marcar como lida automaticamente — usuário decide quando marcar
+    // Apenas salvar o log de quem foi delegado
     saveDelegationInfo(pub.cnj, addedNames, obs);
-    
-    // Sincronizar com Sheets
-    if (CONFIG.APPS_SCRIPT_URL) {
-        fetch(CONFIG.APPS_SCRIPT_URL, {
-            method: 'POST',
-            headers: { 'Content-Type': 'text/plain' },
-            body: JSON.stringify({ 
-                action: 'updateStatus', 
-                cnj: pub.cnj, 
-                status: 'LIDO', 
-                observacoes: pub.observacoes 
-            })
-        }).catch(err => console.error('Erro ao enviar observações p/ Sheets:', err));
-    }
 
     saveDelegationQueue();
     renderTable();
