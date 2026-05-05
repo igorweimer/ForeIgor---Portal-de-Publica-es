@@ -138,12 +138,29 @@ document.addEventListener('DOMContentLoaded', () => {
     setInterval(processSyncQueue, 3000);
 });
 
-// ─── Detecta se o usuário está digitando em algum campo do accordion ───
-function isUserEditing() {
+// ─── Detecta se o usuário está interagindo com a página ───
+// Se sim, o auto-refresh NÃO re-renderiza nada (zero flicker).
+function isUserBusy() {
+    // 1. Publicação aberta (lendo teor)
+    if (expandedUid) return true;
+    // 2. Mailbox aberta
+    const mailbox = document.getElementById('mailbox-modal');
+    if (mailbox && !mailbox.classList.contains('hidden')) return true;
+    // 3. Modal de confirmação visível
+    const confirmModal = document.getElementById('confirm-read-modal');
+    if (confirmModal && confirmModal.style.display === 'flex') return true;
+    // 4. Digitando em algum campo
     const el = document.activeElement;
-    if (!el) return false;
-    const tag = el.tagName.toLowerCase();
-    return (tag === 'textarea' || tag === 'input') && !!el.closest('.detail-row, .delegation-box, .mbox-subject-row');
+    if (el) {
+        const tag = el.tagName.toLowerCase();
+        if ((tag === 'textarea' || tag === 'input') && !!el.closest('.detail-row, .delegation-box, .mbox-subject-row, .filter-bar')) return true;
+    }
+    return false;
+}
+
+// Mantém compatibilidade com referências antigas
+function isUserEditing() {
+    return isUserBusy();
 }
 
 // ─── Modal de confirmação (caixinha no canto inferior) ───
@@ -169,16 +186,16 @@ function askConfirmRead(msg, callback) {
 
 // ─────────── FETCH DATA ───────────
 async function fetchPublications() {
-    // Se o usuário está digitando, atualiza os dados mas NÃO re-renderiza
-    // para não apagar o que ele está escrevendo
-    if (isUserEditing()) {
+    // Se o usuário está interagindo (lendo publicação, mailbox, editando),
+    // atualiza os dados em memória mas NÃO toca no DOM — zero flicker.
+    if (isUserBusy()) {
         try {
             const cacheBust = `?t=${Date.now()}`;
             const response = await fetch(CONFIG.APPS_SCRIPT_URL + cacheBust);
             const data = await response.json();
             allPublications = data.map(normalizePublication);
             detectNewPublications();
-            setSyncStatus('ok', 'Conectado (modo edição)');
+            setSyncStatus('ok', 'Conectado');
         } catch(e) { /* silencioso */ }
         return;
     }
@@ -197,7 +214,9 @@ async function fetchPublications() {
 
         loadEmailQueueFromSheets();
         detectNewPublications();
-        applyFilters();
+        // Preservar a página atual durante auto-refresh (quando já havia dados carregados)
+        const isAutoRefresh = filteredPublications.length > 0;
+        applyFilters(isAutoRefresh);
         populateFilterDropdowns();
         updateCounters();
         setSyncStatus('ok', 'Conectado');
@@ -976,7 +995,7 @@ function updateGroupFilter(parentCb) {
     children.forEach(cb => { if (cb !== parentCb) cb.checked = parentCb.checked; });
 }
 
-function applyFilters() {
+function applyFilters(preservePage) {
     filteredPublications = allPublications.filter(pub => {
         // Status filter
         if (filters.status === 'lido' && pub.status !== 'LIDO') return false;
@@ -1022,7 +1041,15 @@ function applyFilters() {
     // Aplicar ordenação dinâmica
     applySorting();
 
-    currentPage = 1;
+    // Só resetar para a página 1 quando os filtros mudam (NÃO quando marca lido/não lido)
+    if (!preservePage) {
+        currentPage = 1;
+    } else {
+        // Garantir que a página atual ainda é válida após a filtragem
+        const isAll = perPage === 'all';
+        const totalPages = isAll ? 1 : Math.ceil(filteredPublications.length / perPage);
+        if (currentPage > totalPages && totalPages > 0) currentPage = totalPages;
+    }
     renderTable();
 }
 
@@ -1553,13 +1580,13 @@ function toggleStatus(_uid) {
             pub.status = next;
             setStatus(pub.cnj, next, pub._uid, pub.idPublicacao);
             selectedRowUid = _uid;
-            applyFilters();
+            applyFilters(true);
         });
     } else {
         pub.status = next;
         setStatus(pub.cnj, next, pub._uid, pub.idPublicacao);
         selectedRowUid = _uid;
-        applyFilters();
+        applyFilters(true);
     }
 }
 
@@ -1576,14 +1603,14 @@ function toggleStatusInline(_uid) {
             setStatus(pub.cnj, next, pub._uid, pub.idPublicacao);
             expandedUid = null;
             selectedRowUid = _uid;
-            applyFilters();
+            applyFilters(true);
         });
     } else {
         pub.status = next;
         setStatus(pub.cnj, next, pub._uid, pub.idPublicacao);
         expandedUid = null;
         selectedRowUid = _uid;
-        applyFilters();
+        applyFilters(true);
     }
 }
 
@@ -1599,7 +1626,7 @@ function markStatusInline(_uid, newStatus) {
             setStatus(pub.cnj, newStatus, pub._uid, pub.idPublicacao);
             expandedUid = null;
             selectedRowUid = _uid;
-            applyFilters();
+            applyFilters(true);
         });
         return;
     }
@@ -1607,7 +1634,7 @@ function markStatusInline(_uid, newStatus) {
     setStatus(pub.cnj, newStatus, pub._uid, pub.idPublicacao);
     expandedUid = null;
     selectedRowUid = _uid;
-    applyFilters();
+    applyFilters(true);
 }
 
 
@@ -1908,24 +1935,49 @@ function addToDelegationQueue(btn, _uid) {
         return;
     }
 
-    const addedNames = [];
-    checkboxes.forEach(cb => {
-        const email = cb.value;
-        const name = cb.dataset.name;
-        addedNames.push(name);
+    const cbArray = Array.from(checkboxes);
+    const addedNames = cbArray.map(cb => cb.dataset.name);
+
+    // Se múltiplos destinatários, agrupar em UM único e-mail
+    if (cbArray.length > 1) {
+        const emails = cbArray.map(cb => cb.value);
+        const groupKey = emails.sort().join(',');
+        const groupName = addedNames.join(', ');
+
+        if (!delegationQueue[groupKey]) {
+            delegationQueue[groupKey] = { name: groupName, isGroup: true, items: [] };
+        }
+
+        const existing = delegationQueue[groupKey].items.findIndex(item => item._uid === _uid);
+        if (existing !== -1) {
+            delegationQueue[groupKey].items[existing].obs = obs;
+            delegationQueue[groupKey].items[existing].files = files;
+        } else {
+            delegationQueue[groupKey].items.push({
+                cnj: pub.cnj,
+                _uid: _uid,
+                orgao: pub.orgaoExpedidor,
+                tipo: pub.tipoPublicacao,
+                dataStr: pub.dataStr || pub.dataDisponibilizacao || '',
+                obs: obs,
+                files: files
+            });
+        }
+    } else {
+        // Destinatário único — comportamento original
+        const email = cbArray[0].value;
+        const name = cbArray[0].dataset.name;
 
         if (!delegationQueue[email]) {
             delegationQueue[email] = { name: name, items: [] };
         }
 
-        const queueKey = email;
-        const existing = delegationQueue[queueKey].items.findIndex(item => item._uid === _uid);
-        
+        const existing = delegationQueue[email].items.findIndex(item => item._uid === _uid);
         if (existing !== -1) {
-            delegationQueue[queueKey].items[existing].obs = obs;
-            delegationQueue[queueKey].items[existing].files = files;
+            delegationQueue[email].items[existing].obs = obs;
+            delegationQueue[email].items[existing].files = files;
         } else {
-            delegationQueue[queueKey].items.push({ 
+            delegationQueue[email].items.push({ 
                 cnj: pub.cnj, 
                 _uid: _uid,
                 orgao: pub.orgaoExpedidor, 
@@ -1935,7 +1987,7 @@ function addToDelegationQueue(btn, _uid) {
                 files: files
             });
         }
-    });
+    }
 
     // NÃO marcar como lida automaticamente — usuário decide quando marcar
     // Apenas salvar o log de quem foi delegado
@@ -2049,30 +2101,62 @@ function addToMailboxInline(_uid) {
 
     console.log(`[Mailbox] Delegando para ${selected.length} colegas.`);
 
-    selected.forEach(cb => {
-        const email = cb.getAttribute('data-email');
-        const nome = cb.getAttribute('data-nome');
+    // Se múltiplos destinatários selecionados, agrupar em um único e-mail
+    if (selected.length > 1) {
+        const emails = selected.map(cb => cb.getAttribute('data-email'));
+        const nomes = selected.map(cb => cb.getAttribute('data-nome'));
+        const groupKey = emails.sort().join(',');
+        const groupName = nomes.join(', ');
         
-        if (!delegationQueue[email]) {
-            delegationQueue[email] = { nome: nome, items: [] };
+        if (!delegationQueue[groupKey]) {
+            delegationQueue[groupKey] = { name: groupName, isGroup: true, items: [] };
         }
         
-        // Evitar duplicidade da mesma pub para a mesma pessoa
-        const alreadyExists = delegationQueue[email].items.some(it => it.pub._uid === _uid);
+        const alreadyExists = delegationQueue[groupKey].items.some(it => it._uid === _uid);
         if (!alreadyExists) {
-            delegationQueue[email].items.push({
-                pub: pub,
+            delegationQueue[groupKey].items.push({
+                cnj: pub.cnj,
+                _uid: _uid,
+                orgao: pub.orgaoExpedidor,
+                tipo: pub.tipoPublicacao,
+                dataStr: pub.dataStr || pub.dataDisponibilizacao || '',
                 obs: obs,
                 files: [...filesAttached]
             });
         }
-    });
+        
+        saveDelegationInfo(pub.cnj, nomes, obs);
+    } else {
+        // Destinatário único — comportamento original
+        const cb = selected[0];
+        const email = cb.getAttribute('data-email');
+        const nome = cb.getAttribute('data-nome');
+        
+        if (!delegationQueue[email]) {
+            delegationQueue[email] = { name: nome, items: [] };
+        }
+        
+        const alreadyExists = delegationQueue[email].items.some(it => it._uid === _uid);
+        if (!alreadyExists) {
+            delegationQueue[email].items.push({
+                cnj: pub.cnj,
+                _uid: _uid,
+                orgao: pub.orgaoExpedidor,
+                tipo: pub.tipoPublicacao,
+                dataStr: pub.dataStr || pub.dataDisponibilizacao || '',
+                obs: obs,
+                files: [...filesAttached]
+            });
+        }
+        
+        saveDelegationInfo(pub.cnj, [nome], obs);
+    }
 
     // Limpar arquivos temporários desta publicação
     delete tempFiles[_uid];
     
     // Persistir
-    localStorage.setItem('foreigor_delegation_queue', JSON.stringify(delegationQueue));
+    saveDelegationQueue();
     
     // Feedback
     alert('Publicação adicionada à fila de disparos com sucesso!');
@@ -2297,13 +2381,21 @@ function saveDelegationInfo(cnj, names, obs) {
     } catch(e) { console.error('Erro ao salvar delegation log:', e); }
 }
 
+function getGreeting() {
+    const hour = new Date().getHours();
+    if (hour >= 0 && hour < 12) return 'Bom dia';
+    if (hour >= 12 && hour < 18) return 'Boa tarde';
+    return 'Boa noite';
+}
+
 function buildEmailBody(recipientNames, items, isGroup) {
+    const greeting = getGreeting();
     let body = `<div style="font-family: Arial, sans-serif; font-size: 14px; color: #333;">`;
     
     if (isGroup) {
-        body += `<p>Bom dia, <strong>pessoal</strong>!</p><br>`;
+        body += `<p>${greeting}, <strong>pessoal</strong>!</p><br>`;
     } else {
-        body += `<p>Bom dia, <strong>${recipientNames}</strong>!</p><br>`;
+        body += `<p>${greeting}, <strong>${recipientNames}</strong>!</p><br>`;
     }
     
     items.forEach(item => {
