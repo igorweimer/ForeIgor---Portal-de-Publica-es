@@ -1441,7 +1441,7 @@ function renderAccordionRow(pub) {
                             <label class="del-email-opt"><input type="checkbox" value="renan.siqueira@gramadoparks.com" data-name="Renan"> Renan</label>
                             <label class="del-email-opt"><input type="checkbox" value="giovani.silva@gramadoparks.com" data-name="Giovani"> Giovani</label>
                             <label class="del-email-opt"><input type="checkbox" value="bruna.santos@gramadoparks.com" data-name="Bruna"> Bruna</label>
-                            <label class="del-email-opt"><input type="checkbox" value="fernanda.meneses@gramadoparks.com" data-name="Fernanda"> Fernanda</label>
+
                             <label class="del-email-opt"><input type="checkbox" value="igor.weimer@gramadoparks.com" data-name="Igor"> Igor</label>
                             <label class="del-email-opt"><input type="checkbox" value="franciele.ribeiro@gramadoparks.com" data-name="Franciele"> Franciele</label>
                             <label class="del-email-opt"><input type="checkbox" value="rafaela.cardoso@gramadoparks.com" data-name="Rafaela"> Rafaela</label>
@@ -2392,18 +2392,34 @@ function buildEmailBody(recipientNames, items, isGroup) {
     const greeting = getGreeting();
     let body = `<div style="font-family: Arial, sans-serif; font-size: 14px; color: #333;">`;
     
+    // Determinar o nome para a saudação:
+    // - "Processos" é apenas para conferência, não conta como pessoa real
+    // - Se for grupo, verificar quantas pessoas REAIS existem (excluindo "Processos")
+    // - Se só 1 pessoa real (+ processos opcional), usar o nome dela
+    // - Se 2+ pessoas reais, usar "pessoal"
+    let greetingName = '';
     if (isGroup) {
-        body += `<p>${greeting}, <strong>pessoal</strong>!</p><br>`;
+        const names = String(recipientNames).split(',').map(n => n.trim());
+        const realPeople = names.filter(n => n.toLowerCase() !== 'processos');
+        if (realPeople.length === 1) {
+            greetingName = realPeople[0];
+        } else {
+            greetingName = 'pessoal';
+        }
     } else {
-        body += `<p>${greeting}, <strong>${recipientNames}</strong>!</p><br>`;
+        // Destinatário único
+        const singleName = String(recipientNames).trim();
+        greetingName = singleName.toLowerCase() === 'processos' ? 'pessoal' : singleName;
     }
+    
+    body += `<p>${greeting}, ${greetingName}!</p><br>`;
     
     items.forEach(item => {
         let obsText = item.obs && item.obs !== 'Sem instrução — clique para editar' ? ` - ${item.obs}` : '';
         body += `<p style="margin: 0 0 5px 0;">${item.cnj}${obsText}</p>`;
     });
     
-    body += `<br><p>Atenciosamente,<br><strong>Rachel Brock</strong></p></div>`;
+    body += `<br><p>Atenciosamente,<br>Rachel Brock</p></div>`;
     
     return body;
 }
@@ -2493,24 +2509,112 @@ function itemsToSimpleText(items) {
     return items.map(i => `${i.cnj} - ${i.obs || ''}`).join(' | ');
 }
 
-// Botao de Enviar Todos (pode ser iterativo ou uma super requisição)
-function flushAllMailbox() {
+// Versão async do flushMailbox para uso sequencial no flushAllMailbox
+function flushMailboxAsync(queueKey) {
+    return new Promise((resolve, reject) => {
+        if (!CONFIG.APPS_SCRIPT_URL) {
+            showToast('Erro: APPS_SCRIPT_URL não configurado.', 'error');
+            reject(new Error('APPS_SCRIPT_URL não configurado'));
+            return;
+        }
+
+        const data = delegationQueue[queueKey];
+        if (!data || data.items.length === 0) {
+            resolve();
+            return;
+        }
+
+        const actualEmail = getActualEmail(queueKey);
+        const safeKey = queueKey.replace(/[^a-zA-Z0-9]/g, '_');
+
+        const subjectInput = document.getElementById(`subject-${safeKey}`);
+        const subject = subjectInput ? subjectInput.value.trim() : (data.subject || generateSubjectFromDates(data.items));
+
+        const htmlBody = buildEmailBody(data.name, data.items, data.isGroup);
+
+        let attachments = [];
+        data.items.forEach(item => {
+            if (item.files && item.files.length > 0) {
+                item.files.forEach(f => {
+                    attachments.push({
+                        name: String(f.name),
+                        mimeType: String(f.type),
+                        content: String(f.data)
+                    });
+                });
+            }
+        });
+
+        const btnId = `btn-flush-${safeKey}`;
+        const btn = document.getElementById(btnId);
+        if (btn) btn.innerHTML = `<i data-lucide="loader" class="spin"></i> Enviando...`;
+
+        showToast(`O e-mail para ${data.name} está sendo enviado...`, 'info');
+
+        const textLog = itemsToSimpleText(data.items);
+
+        data.items.forEach(item => {
+            saveDelegationInfo(item.cnj, [data.name], item.obs || '');
+        });
+
+        fetch(CONFIG.APPS_SCRIPT_URL, {
+            method: 'POST',
+            headers: { 'Content-Type': 'text/plain' },
+            body: JSON.stringify({
+                action: 'sendEmails',
+                to: actualEmail,
+                subject: subject,
+                htmlBody: htmlBody,
+                attachments: attachments
+            })
+        }).then(res => res.json())
+          .then(resData => {
+              if (resData.status === 'ok') {
+                  showToast(`✓ E-mail enviado para ${data.name}!`, 'success');
+                  saveToHistory(actualEmail, data.name, data.items, subject);
+                  logDelegationToSheets(actualEmail, data.name, data.items, textLog);
+                  delete delegationQueue[queueKey];
+                  saveDelegationQueue();
+                  renderMailbox();
+                  resolve();
+              } else {
+                  throw new Error(resData.error || 'Erro desconhecido');
+              }
+          })
+          .catch(err => {
+              console.error(err);
+              showToast(`Erro ao enviar e-mail: ${err.message}`, 'error');
+              if (btn) btn.innerHTML = `<i data-lucide="send"></i> Enviar E-mails`;
+              lucide.createIcons();
+              reject(err);
+          });
+    });
+}
+
+// Botao de Enviar Todos — sequencial para evitar duplicação
+async function flushAllMailbox() {
     if (Object.keys(delegationQueue).length === 0) return;
     
     if (!confirm('Deseja enviar todos os e-mails da fila pendente de uma vez?')) return;
     
     showToast('Iniciando envio em lote...', 'info');
     
-    // Itera enviando 1 a 1 para não explodir tempo limite do Apps Script
-    const emails = Object.keys(delegationQueue);
-    let delay = 0;
+    // Capturar as chaves ANTES de iniciar (snapshot)
+    const keysToSend = Object.keys(delegationQueue).slice();
     
-    emails.forEach((email) => {
-        setTimeout(() => {
-            flushMailbox(email);
-        }, delay);
-        delay += 1000; // 1 second headstart per email
-    });
+    for (const queueKey of keysToSend) {
+        // Verificar se ainda existe na fila (pode ter sido removido pelo envio anterior)
+        if (!delegationQueue[queueKey] || delegationQueue[queueKey].items.length === 0) {
+            continue;
+        }
+        try {
+            await flushMailboxAsync(queueKey);
+        } catch (err) {
+            console.error(`Erro ao enviar para ${queueKey}:`, err);
+        }
+    }
+    
+    showToast('Envio em lote concluído!', 'success');
 }
 
 function downloadBase64File(dataUrl, filename) {
