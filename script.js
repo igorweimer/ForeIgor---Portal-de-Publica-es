@@ -1440,12 +1440,15 @@ function renderAccordionRow(pub) {
                                                         <label class="del-email-opt"><input type="checkbox" value="processos.juridico@gramadoparks.com" data-name="Processos"> Processos</label>
                             <label class="del-email-opt"><input type="checkbox" value="renan.siqueira@gramadoparks.com" data-name="Renan"> Renan</label>
                             <label class="del-email-opt"><input type="checkbox" value="giovani.silva@gramadoparks.com" data-name="Giovani"> Giovani</label>
-                            <label class="del-email-opt"><input type="checkbox" value="bruna.santos@gramadoparks.com" data-name="Bruna"> Bruna</label>
+                            <label class="del-email-opt"><input type="checkbox" value="bruna.dressler@gramadoparks.com" data-name="Bruna"> Bruna</label>
 
                             <label class="del-email-opt"><input type="checkbox" value="igor.weimer@gramadoparks.com" data-name="Igor"> Igor</label>
                             <label class="del-email-opt"><input type="checkbox" value="franciele.ribeiro@gramadoparks.com" data-name="Franciele"> Franciele</label>
-                            <label class="del-email-opt"><input type="checkbox" value="rafaela.cardoso@gramadoparks.com" data-name="Rafaela"> Rafaela</label>
+                            <label class="del-email-opt"><input type="checkbox" value="nathalia.silva@gramadoparks.com" data-name="Nathalia"> Nathalia</label>
                             <label class="del-email-opt"><input type="checkbox" value="luciano.ferreira@gramadoparks.com" data-name="Luciano"> Luciano</label>
+                            <label class="del-email-opt"><input type="checkbox" value="liriel.lazzarin@gramadoparks.com" data-name="Liriel"> Liriel</label>
+                            <label class="del-email-opt"><input type="checkbox" value="fernao.brito@gramadoparks.com" data-name="Fernão"> Fernão</label>
+                            <label class="del-email-opt"><input type="checkbox" value="eduardo.ferreira@gramadoparks.com" data-name="Eduardo"> Eduardo</label>
                         </div>
                         <textarea class="del-obs-text" placeholder="Ex: Para recorrer com urgência... Você também pode dar Ctrl+V aqui para colar prints." onpaste="handlePaste(event, '${escapeHtml(pub._uid)}')" style="width: 100%; height: 60px; padding: 8px; border-radius: 6px; border: 1px solid #d1d5db; resize: none; outline: none; font-size: 0.85rem; font-family: 'Inter', sans-serif;"></textarea>
                         
