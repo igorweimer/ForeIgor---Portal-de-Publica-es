@@ -15,6 +15,13 @@ const CONFIG = {
     REFRESH_INTERVAL: 60 * 1000, // 60 segundos — menos interrupções ao trabalhar
 };
 
+// Bruna e Mirelle recebem sempre um e-mail separado por publicação, mesmo
+// quando outros destinatários estiverem no mesmo envio.
+const ONE_EMAIL_PER_PUBLICATION_RECIPIENTS = new Set([
+    'bruna.dressler@gramadoparks.com',
+    'mirelle.ribas@gramadoparks.com'
+]);
+
 // ─────────── MAPEAMENTO DE TRIBUNAIS ───────────
 // Formato CNJ: NNNNNNN-DD.AAAA.J.TR.OOOO
 // J=8 → Justiça Estadual (Cível), J=5 → Justiça do Trabalho
@@ -294,7 +301,7 @@ const DETECTION_DATA = {
         {"name": "RACHEL BROCK", "oab": "49.636"},
         {"name": "PAULA RENATA MONTEIRO DE BRITO", "oab": "109.453"},
         {"name": "RENAN PERIM SIQUEIRA", "oab": "132.154A"},
-        {"name": "GIOVANI MARCEL GONÇALVES DA SILVA", "oab": "104.372"}
+        {"name": "MIRELLE OPPITZ RIBAS", "oab": "50.572"}
     ]
 };
 
@@ -1439,7 +1446,7 @@ function renderAccordionRow(pub) {
                         <div class="del-checkbox-list" style="display: flex; flex-direction: column; gap: 4px; margin-bottom: 10px; max-height: 200px; overflow-y: auto; padding: 8px; border: 1px solid #d1d5db; border-radius: 6px; background: #fff;">
                                                         <label class="del-email-opt"><input type="checkbox" value="processos.juridico@gramadoparks.com" data-name="Processos"> Processos</label>
                             <label class="del-email-opt"><input type="checkbox" value="renan.siqueira@gramadoparks.com" data-name="Renan"> Renan</label>
-                            <label class="del-email-opt"><input type="checkbox" value="giovani.silva@gramadoparks.com" data-name="Giovani"> Giovani</label>
+                            <label class="del-email-opt"><input type="checkbox" value="mirelle.ribas@gramadoparks.com" data-name="Mirelle"> Mirelle</label>
                             <label class="del-email-opt"><input type="checkbox" value="bruna.dressler@gramadoparks.com" data-name="Bruna"> Bruna</label>
 
                             <label class="del-email-opt"><input type="checkbox" value="igor.weimer@gramadoparks.com" data-name="Igor"> Igor</label>
@@ -1898,8 +1905,9 @@ function saveDelegationQueue() {
         console.error('Erro ao salvar fila no localStorage:', e);
     }
     // Sincronizar com a planilha (fonte da verdade)
-    saveEmailQueueToSheets();
+    const sheetsSave = saveEmailQueueToSheets();
     updateDelegationBadge();
+    return sheetsSave;
 }
 
 // Handler para o evento de colar (Ctrl+V) na textarea de observações
@@ -2203,13 +2211,18 @@ function renderMailbox() {
         if (!data.items || data.items.length === 0) continue;
         
         const actualEmail = getActualEmail(queueKey);
+        const sendsOneEmailPerPublication = requiresOneEmailPerPublication(queueKey);
         const safeKey = queueKey.replace(/[^a-zA-Z0-9]/g, '_');
         const initials = data.name.split(' ').map(n => n[0]).join('').substring(0, 2).toUpperCase();
         const isCustomGroup = data.isCustomGroup || false;
         
         // Auto-generate subject from publication dates (not today)
         const defaultSubject = generateSubjectFromDates(data.items);
-        const currentSubject = data.subject || defaultSubject;
+        const currentSubject = sendsOneEmailPerPublication
+            ? (data.items.length === 1
+                ? generatePublicationEmailSubject(data.items[0])
+                : `${data.items.length} assuntos automáticos — um por publicação`)
+            : (data.subject || defaultSubject);
         
         let itemsHtml = data.items.map((item, idx) => {
             const obsClass = item.obs ? 'mbox-item-obs' : 'mbox-item-obs mbox-item-obs-empty';
@@ -2251,7 +2264,7 @@ function renderMailbox() {
                     <div class="mbox-recipient-avatar">${initials}</div>
                     <div>
                         <div class="mbox-recipient-name">${escapeHtml(data.name)}${isCustomGroup ? ' <span class="mbox-custom-tag">Título Personalizado</span>' : ''}</div>
-                        <div class="mbox-recipient-email">${escapeHtml(actualEmail)} · ${data.items.length} publicação(ões)</div>
+                        <div class="mbox-recipient-email">${escapeHtml(actualEmail)} · ${data.items.length} publicação(ões)${sendsOneEmailPerPublication ? ` · ${data.items.length} e-mail(s) individual(is)` : ''}</div>
                     </div>
                 </div>
                 <div class="mbox-recipient-actions">
@@ -2262,10 +2275,12 @@ function renderMailbox() {
             </div>
             
             <div class="mbox-subject-row">
-                <div class="mbox-subject-label"><i data-lucide="mail" style="width:14px;height:14px;"></i> Assunto do E-mail:</div>
+                <div class="mbox-subject-label"><i data-lucide="mail" style="width:14px;height:14px;"></i> ${sendsOneEmailPerPublication ? 'Assuntos dos E-mails:' : 'Assunto do E-mail:'}</div>
                 <input type="text" class="mbox-subject-input" id="subject-${safeKey}" 
                        value="${escapeHtml(currentSubject)}" 
-                       onchange="updateRecipientSubject('${escapeHtml(queueKey)}', this.value)" 
+                       ${sendsOneEmailPerPublication
+                           ? 'readonly aria-readonly="true" title="Assunto automático: data e número do processo"'
+                           : `onchange="updateRecipientSubject('${escapeHtml(queueKey)}', this.value)"`}
                        placeholder="Título do e-mail">
             </div>
             
@@ -2311,6 +2326,24 @@ function removeQueueItem(email, idx) {
 function getActualEmail(queueKey) {
     if (queueKey.includes('|custom|')) return queueKey.split('|custom|')[0];
     return queueKey;
+}
+
+function getRecipientEmails(queueKey) {
+    return getActualEmail(queueKey)
+        .split(/[;,]/)
+        .map(email => email.trim().toLowerCase())
+        .filter(Boolean);
+}
+
+function requiresOneEmailPerPublication(queueKey) {
+    return getRecipientEmails(queueKey)
+        .some(email => ONE_EMAIL_PER_PUBLICATION_RECIPIENTS.has(email));
+}
+
+function generatePublicationEmailSubject(item) {
+    const publicationDate = item && item.dataStr ? item.dataStr : formatDateShort(new Date());
+    const cnj = item && item.cnj ? item.cnj : 'Processo não informado';
+    return `Intimações ${publicationDate} - ${cnj}`;
 }
 
 // Gera título do e-mail baseado nas datas das publicações (não na data de hoje)
@@ -2415,97 +2448,170 @@ function buildEmailBody(recipientNames, items, isGroup) {
         greetingName = singleName.toLowerCase() === 'processos' ? 'pessoal' : singleName;
     }
     
-    body += `<p>${greeting}, ${greetingName}!</p><br>`;
-    
-    items.forEach(item => {
-        let obsText = item.obs && item.obs !== 'Sem instrução — clique para editar' ? ` - ${item.obs}` : '';
-        body += `<p style="margin: 0 0 5px 0;">${item.cnj}${obsText}</p>`;
+    body += `<p>${greeting}, ${escapeHtml(greetingName)}!</p><br>`;
+
+    const dateGroups = [];
+    const groupsByDate = new Map();
+    (items || []).forEach(item => {
+        const dateLabel = item.dataStr || 'Data não informada';
+        if (!groupsByDate.has(dateLabel)) {
+            const group = { dateLabel: dateLabel, items: [] };
+            groupsByDate.set(dateLabel, group);
+            dateGroups.push(group);
+        }
+        groupsByDate.get(dateLabel).items.push(item);
     });
+
+    const hasMultipleDates = dateGroups.length > 1;
+    if (hasMultipleDates) {
+        dateGroups.sort((a, b) => {
+            const dateA = parseDate(a.dateLabel);
+            const dateB = parseDate(b.dateLabel);
+            if (dateA && dateB) return dateA - dateB;
+            if (dateA) return -1;
+            if (dateB) return 1;
+            return a.dateLabel.localeCompare(b.dateLabel);
+        });
+    }
+
+    const appendItem = item => {
+        const hasObs = item.obs && item.obs !== 'Sem instrução — clique para editar';
+        const obsText = hasObs ? ` - ${escapeHtml(item.obs)}` : '';
+        body += `<p style="margin: 0 0 5px 0;">${escapeHtml(item.cnj || '')}${obsText}</p>`;
+    };
+
+    if (hasMultipleDates) {
+        dateGroups.forEach(group => {
+            body += `<p style="margin: 0 0 12px 0;"><strong>${escapeHtml(group.dateLabel)}:</strong></p>`;
+            group.items.forEach(appendItem);
+            body += '<br>';
+        });
+    } else {
+        (items || []).forEach(appendItem);
+    }
     
     body += `<br><p>Atenciosamente,<br>Rachel Brock</p></div>`;
     
     return body;
 }
 
-function flushMailbox(queueKey) {
-    if (!CONFIG.APPS_SCRIPT_URL) {
-        showToast('Erro: APPS_SCRIPT_URL não configurado.', 'error');
-        return;
-    }
-
-    const data = delegationQueue[queueKey];
-    if (!data || data.items.length === 0) return;
-    
-    const actualEmail = getActualEmail(queueKey);
-    const safeKey = queueKey.replace(/[^a-zA-Z0-9]/g, '_');
-    
-    // Pegar o assunto do input (permite edição em tempo real) ou do objeto
-    const subjectInput = document.getElementById(`subject-${safeKey}`);
-    const subject = subjectInput ? subjectInput.value.trim() : (data.subject || generateSubjectFromDates(data.items));
-    
-    const htmlBody = buildEmailBody(data.name, data.items, data.isGroup);
-    
-    // Preparar os anexos
-    let attachments = [];
-    data.items.forEach(item => {
-        if (item.files && item.files.length > 0) {
-            item.files.forEach(f => {
-                attachments.push({
-                    name: String(f.name),
-                    mimeType: String(f.type),
-                    content: String(f.data) // Base64
-                });
+function getAttachmentsForItems(items) {
+    const attachments = [];
+    (items || []).forEach(item => {
+        (item.files || []).forEach(file => {
+            attachments.push({
+                name: String(file.name),
+                mimeType: String(file.type),
+                content: String(file.data)
             });
-        }
+        });
     });
+    return attachments;
+}
 
-    const btnId = `btn-flush-${safeKey}`;
-    const btn = document.getElementById(btnId);
-    if (btn) btn.innerHTML = `<i data-lucide="loader" class="spin"></i> Enviando...`;
+function createEmailDispatches(queueKey, data, subjectOverride) {
+    const actualEmail = getActualEmail(queueKey);
+    const sendSeparately = requiresOneEmailPerPublication(queueKey);
+    const itemGroups = sendSeparately
+        ? data.items.map(item => [item])
+        : [data.items.slice()];
 
-    showToast(`O e-mail para ${data.name} está sendo enviado...`, 'info');
+    return itemGroups.map(dispatchItems => ({
+        to: actualEmail,
+        subject: sendSeparately
+            ? generatePublicationEmailSubject(dispatchItems[0])
+            : (subjectOverride || data.subject || generateSubjectFromDates(dispatchItems)),
+        htmlBody: buildEmailBody(data.name, dispatchItems, data.isGroup),
+        attachments: getAttachmentsForItems(dispatchItems),
+        items: dispatchItems
+    }));
+}
 
-    // Mapear apenas para log de texto
-    const textLog = itemsToSimpleText(data.items);
-    
-    // Salvar info de delegação para cada CNJ enviado
-    data.items.forEach(item => {
-        saveDelegationInfo(item.cnj, [data.name], item.obs || '');
-    });
+function removeDispatchedItems(queueKey, dispatchedItems) {
+    const current = delegationQueue[queueKey];
+    if (!current) return;
 
-    fetch(CONFIG.APPS_SCRIPT_URL, {
+    const sentItems = new Set(dispatchedItems);
+    current.items = current.items.filter(item => !sentItems.has(item));
+    if (current.items.length === 0) delete delegationQueue[queueKey];
+}
+
+async function postEmailDispatch(dispatch) {
+    const response = await fetch(CONFIG.APPS_SCRIPT_URL, {
         method: 'POST',
         headers: { 'Content-Type': 'text/plain' },
         body: JSON.stringify({
             action: 'sendEmails',
-            to: actualEmail,
-            subject: subject,
-            htmlBody: htmlBody,
-            attachments: attachments
+            to: dispatch.to,
+            subject: dispatch.subject,
+            htmlBody: dispatch.htmlBody,
+            attachments: dispatch.attachments
         })
-    }).then(res => res.json())
-      .then(resData => {
-          if (resData.status === 'ok') {
-              showToast(`✓ E-mail enviado para ${data.name}!`, 'success');
-              
-              // Registrar no histórico
-              saveToHistory(actualEmail, data.name, data.items, subject);
-              // Log na planilha
-              logDelegationToSheets(actualEmail, data.name, data.items, textLog);
-              
-              delete delegationQueue[queueKey];
-              saveDelegationQueue();
-              renderMailbox();
-          } else {
-              throw new Error(resData.error || 'Erro desconhecido');
-          }
-      })
-      .catch(err => {
-          console.error(err);
-          showToast(`Erro ao enviar e-mail: ${err.message}`, 'error');
-          if (btn) btn.innerHTML = `<i data-lucide="send"></i> Enviar E-mails`;
-          lucide.createIcons();
-      });
+    });
+    const responseData = await response.json();
+    if (responseData.status !== 'ok') {
+        throw new Error(responseData.error || 'Erro desconhecido');
+    }
+}
+
+async function sendMailboxEntry(queueKey) {
+    if (!CONFIG.APPS_SCRIPT_URL) {
+        throw new Error('APPS_SCRIPT_URL não configurado');
+    }
+
+    const data = delegationQueue[queueKey];
+    if (!data || data.items.length === 0) return 0;
+
+    const safeKey = queueKey.replace(/[^a-zA-Z0-9]/g, '_');
+    const subjectInput = document.getElementById(`subject-${safeKey}`);
+    const subjectOverride = requiresOneEmailPerPublication(queueKey)
+        ? ''
+        : (subjectInput ? subjectInput.value.trim() : '');
+    const dispatches = createEmailDispatches(queueKey, data, subjectOverride);
+
+    const btn = document.getElementById(`btn-flush-${safeKey}`);
+    if (btn) btn.innerHTML = `<i data-lucide="loader" class="spin"></i> Enviando...`;
+
+    showToast(`${dispatches.length} e-mail(s) para ${data.name} em envio...`, 'info');
+
+    for (let index = 0; index < dispatches.length; index++) {
+        const dispatch = dispatches[index];
+        await postEmailDispatch(dispatch);
+
+        dispatch.items.forEach(item => {
+            saveDelegationInfo(item.cnj, [data.name], item.obs || '');
+        });
+        saveToHistory(dispatch.to, data.name, dispatch.items, dispatch.subject);
+        logDelegationToSheets(
+            dispatch.to,
+            data.name,
+            dispatch.items,
+            itemsToSimpleText(dispatch.items)
+        );
+
+        // Persistir cada sucesso individualmente. Se um envio seguinte falhar,
+        // só as publicações ainda não enviadas permanecem na fila.
+        removeDispatchedItems(queueKey, dispatch.items);
+        await saveDelegationQueue();
+
+        if (dispatches.length > 1) {
+            showToast(`E-mail ${index + 1} de ${dispatches.length} enviado para ${data.name}.`, 'info');
+        }
+    }
+
+    renderMailbox();
+    return dispatches.length;
+}
+
+async function flushMailbox(queueKey) {
+    try {
+        const sentCount = await sendMailboxEntry(queueKey);
+        if (sentCount > 0) showToast(`✓ ${sentCount} e-mail(s) enviado(s) com sucesso!`, 'success');
+    } catch (err) {
+        console.error(err);
+        showToast(`Erro ao enviar e-mail: ${err.message}`, 'error');
+        renderMailbox();
+    }
 }
 
 function itemsToSimpleText(items) {
@@ -2513,85 +2619,15 @@ function itemsToSimpleText(items) {
 }
 
 // Versão async do flushMailbox para uso sequencial no flushAllMailbox
-function flushMailboxAsync(queueKey) {
-    return new Promise((resolve, reject) => {
-        if (!CONFIG.APPS_SCRIPT_URL) {
-            showToast('Erro: APPS_SCRIPT_URL não configurado.', 'error');
-            reject(new Error('APPS_SCRIPT_URL não configurado'));
-            return;
-        }
-
-        const data = delegationQueue[queueKey];
-        if (!data || data.items.length === 0) {
-            resolve();
-            return;
-        }
-
-        const actualEmail = getActualEmail(queueKey);
-        const safeKey = queueKey.replace(/[^a-zA-Z0-9]/g, '_');
-
-        const subjectInput = document.getElementById(`subject-${safeKey}`);
-        const subject = subjectInput ? subjectInput.value.trim() : (data.subject || generateSubjectFromDates(data.items));
-
-        const htmlBody = buildEmailBody(data.name, data.items, data.isGroup);
-
-        let attachments = [];
-        data.items.forEach(item => {
-            if (item.files && item.files.length > 0) {
-                item.files.forEach(f => {
-                    attachments.push({
-                        name: String(f.name),
-                        mimeType: String(f.type),
-                        content: String(f.data)
-                    });
-                });
-            }
-        });
-
-        const btnId = `btn-flush-${safeKey}`;
-        const btn = document.getElementById(btnId);
-        if (btn) btn.innerHTML = `<i data-lucide="loader" class="spin"></i> Enviando...`;
-
-        showToast(`O e-mail para ${data.name} está sendo enviado...`, 'info');
-
-        const textLog = itemsToSimpleText(data.items);
-
-        data.items.forEach(item => {
-            saveDelegationInfo(item.cnj, [data.name], item.obs || '');
-        });
-
-        fetch(CONFIG.APPS_SCRIPT_URL, {
-            method: 'POST',
-            headers: { 'Content-Type': 'text/plain' },
-            body: JSON.stringify({
-                action: 'sendEmails',
-                to: actualEmail,
-                subject: subject,
-                htmlBody: htmlBody,
-                attachments: attachments
-            })
-        }).then(res => res.json())
-          .then(resData => {
-              if (resData.status === 'ok') {
-                  showToast(`✓ E-mail enviado para ${data.name}!`, 'success');
-                  saveToHistory(actualEmail, data.name, data.items, subject);
-                  logDelegationToSheets(actualEmail, data.name, data.items, textLog);
-                  delete delegationQueue[queueKey];
-                  saveDelegationQueue();
-                  renderMailbox();
-                  resolve();
-              } else {
-                  throw new Error(resData.error || 'Erro desconhecido');
-              }
-          })
-          .catch(err => {
-              console.error(err);
-              showToast(`Erro ao enviar e-mail: ${err.message}`, 'error');
-              if (btn) btn.innerHTML = `<i data-lucide="send"></i> Enviar E-mails`;
-              lucide.createIcons();
-              reject(err);
-          });
-    });
+async function flushMailboxAsync(queueKey) {
+    try {
+        const sentCount = await sendMailboxEntry(queueKey);
+        if (sentCount > 0) showToast(`✓ ${sentCount} e-mail(s) enviado(s) com sucesso!`, 'success');
+    } catch (err) {
+        showToast(`Erro ao enviar e-mail: ${err.message}`, 'error');
+        renderMailbox();
+        throw err;
+    }
 }
 
 // Botao de Enviar Todos — sequencial para evitar duplicação
