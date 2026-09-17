@@ -1310,6 +1310,116 @@ body {
     letter-spacing: 0.5px;
 }
 
+/* === ENVIO DE E-MAILS: PROGRESSO E BLOQUEIO DE DUPLICIDADE === */
+.email-send-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 12000;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 20px;
+    background: rgba(9, 33, 24, 0.72);
+    backdrop-filter: blur(5px);
+}
+
+.email-send-overlay.hidden {
+    display: none;
+}
+
+.email-send-dialog {
+    width: min(460px, 100%);
+    padding: 30px;
+    border-radius: 16px;
+    background: #fff;
+    color: var(--text);
+    text-align: center;
+    box-shadow: 0 28px 80px rgba(0, 0, 0, 0.35);
+}
+
+.email-send-icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 52px;
+    height: 52px;
+    margin-bottom: 12px;
+    border-radius: 50%;
+    background: #ecfdf3;
+    color: var(--primary);
+}
+
+.email-send-icon i {
+    width: 24px;
+    height: 24px;
+}
+
+.email-send-dialog h2 {
+    margin: 0 0 8px;
+    color: var(--primary);
+    font-size: 1.2rem;
+}
+
+.email-send-dialog > p {
+    margin: 0;
+    color: var(--text-muted);
+    font-size: 0.9rem;
+    line-height: 1.45;
+}
+
+.email-send-progress-track {
+    width: 100%;
+    height: 12px;
+    margin-top: 24px;
+    overflow: hidden;
+    border-radius: 999px;
+    background: #e5e7eb;
+}
+
+.email-send-progress-bar {
+    width: 0;
+    height: 100%;
+    border-radius: inherit;
+    background: linear-gradient(90deg, var(--primary), #22c55e);
+    transition: width 0.25s ease;
+}
+
+.email-send-progress-meta {
+    display: flex;
+    justify-content: space-between;
+    margin-top: 8px;
+    color: var(--primary);
+    font-size: 0.86rem;
+}
+
+.email-send-detail {
+    min-height: 22px;
+    margin-top: 18px !important;
+}
+
+.email-send-close-btn {
+    margin-top: 22px;
+    padding: 10px 24px;
+    border: none;
+    border-radius: 8px;
+    background: var(--primary);
+    color: #fff;
+    font-weight: 700;
+    cursor: pointer;
+}
+
+.email-send-close-btn:hover {
+    background: var(--primary-light);
+}
+
+.mailbox-send-all-btn:disabled,
+.mbox-send-btn:disabled {
+    cursor: wait;
+    opacity: 0.65;
+    transform: none;
+    box-shadow: none;
+}
+
 /* === UTILITIES === */
 .hidden { display: none !important; }
 
