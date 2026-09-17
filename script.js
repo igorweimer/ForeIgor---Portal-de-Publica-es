@@ -22,6 +22,24 @@ const ONE_EMAIL_PER_PUBLICATION_RECIPIENTS = new Set([
     'mirelle.ribas@gramadoparks.com'
 ]);
 
+const EMAIL_SEND_MAX_ATTEMPTS = 3;
+const EMAIL_REQUEST_TIMEOUT_MS = 90 * 1000;
+let activeEmailSend = null;
+let emailQueueSyncChain = Promise.resolve();
+
+function createDeliveryId() {
+    if (window.crypto && typeof window.crypto.randomUUID === 'function') {
+        return window.crypto.randomUUID();
+    }
+    return `delivery-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+window.addEventListener('beforeunload', event => {
+    if (!activeEmailSend) return;
+    event.preventDefault();
+    event.returnValue = 'Há e-mails em envio. Aguarde a conclusão para evitar duplicidades.';
+});
+
 // ─────────── MAPEAMENTO DE TRIBUNAIS ───────────
 // Formato CNJ: NNNNNNN-DD.AAAA.J.TR.OOOO
 // J=8 → Justiça Estadual (Cível), J=5 → Justiça do Trabalho
@@ -1876,15 +1894,17 @@ async function loadEmailQueueFromSheets() {
     }
 }
 
-async function saveEmailQueueToSheets() {
+function createEmailQueueSnapshot() {
+    return JSON.parse(JSON.stringify(delegationQueue, (key, value) => key === 'files' ? undefined : value));
+}
+
+async function saveEmailQueueToSheets(queueSnapshot) {
     if (!CONFIG.APPS_SCRIPT_URL) return;
     try {
-        // Serializar sem os arquivos base64 (ficam apenas localmente)
-        const queueClone = JSON.parse(JSON.stringify(delegationQueue, (k, v) => k === 'files' ? undefined : v));
         await fetch(CONFIG.APPS_SCRIPT_URL, {
             method: 'POST',
             headers: { 'Content-Type': 'text/plain' },
-            body: JSON.stringify({ action: 'saveEmailQueue', queue: queueClone })
+            body: JSON.stringify({ action: 'saveEmailQueue', queue: queueSnapshot || createEmailQueueSnapshot() })
         });
         console.log('[Queue] Fila de e-mails sincronizada com a planilha.');
     } catch (e) {
@@ -1894,7 +1914,7 @@ async function saveEmailQueueToSheets() {
 
 // init() removido — inicialização via DOMContentLoaded
 
-function saveDelegationQueue() {
+function saveDelegationQueue({ syncToSheets = true } = {}) {
     try {
         const queueClone = JSON.parse(JSON.stringify(delegationQueue));
         for (let key in queueClone) {
@@ -1904,10 +1924,19 @@ function saveDelegationQueue() {
     } catch (e) {
         console.error('Erro ao salvar fila no localStorage:', e);
     }
-    // Sincronizar com a planilha (fonte da verdade)
-    const sheetsSave = saveEmailQueueToSheets();
+    // Durante um lote, a sincronização remota é feita uma vez no encerramento.
+    // Isso evita regravar a fila inteira a cada e-mail e deixa o disparo mais rápido.
+    const sheetsSave = syncToSheets ? queueEmailQueueSync() : Promise.resolve();
     updateDelegationBadge();
     return sheetsSave;
+}
+
+function queueEmailQueueSync() {
+    const snapshot = createEmailQueueSnapshot();
+    emailQueueSyncChain = emailQueueSyncChain
+        .catch(() => undefined)
+        .then(() => saveEmailQueueToSheets(snapshot));
+    return emailQueueSyncChain;
 }
 
 // Handler para o evento de colar (Ctrl+V) na textarea de observações
@@ -1967,6 +1996,7 @@ function addToDelegationQueue(btn, _uid) {
             delegationQueue[groupKey].items.push({
                 cnj: pub.cnj,
                 _uid: _uid,
+                deliveryId: createDeliveryId(),
                 orgao: pub.orgaoExpedidor,
                 tipo: pub.tipoPublicacao,
                 dataStr: pub.dataStr || pub.dataDisponibilizacao || '',
@@ -1991,6 +2021,7 @@ function addToDelegationQueue(btn, _uid) {
             delegationQueue[email].items.push({ 
                 cnj: pub.cnj, 
                 _uid: _uid,
+                deliveryId: createDeliveryId(),
                 orgao: pub.orgaoExpedidor, 
                 tipo: pub.tipoPublicacao,
                 dataStr: pub.dataStr || pub.dataDisponibilizacao || '',
@@ -2192,7 +2223,10 @@ function renderMailbox() {
     
     // Hide send-all if empty
     const sendAllBtn = document.getElementById('send-all-btn');
-    if (sendAllBtn) sendAllBtn.style.display = totalItems > 0 ? 'flex' : 'none';
+    if (sendAllBtn) {
+        sendAllBtn.style.display = totalItems > 0 ? 'flex' : 'none';
+        sendAllBtn.disabled = Boolean(activeEmailSend);
+    }
     
     if (totalItems === 0) {
         container.innerHTML = `
@@ -2268,7 +2302,7 @@ function renderMailbox() {
                     </div>
                 </div>
                 <div class="mbox-recipient-actions">
-                    <button class="mbox-send-btn" onclick="flushMailbox('${escapeHtml(queueKey)}')" id="btn-flush-${safeKey}">
+                    <button class="mbox-send-btn" onclick="flushMailbox('${escapeHtml(queueKey)}')" id="btn-flush-${safeKey}" ${activeEmailSend ? 'disabled' : ''}>
                         <i data-lucide="send"></i> Enviar E-mails
                     </button>
                 </div>
@@ -2536,124 +2570,243 @@ function removeDispatchedItems(queueKey, dispatchedItems) {
     if (current.items.length === 0) delete delegationQueue[queueKey];
 }
 
-async function postEmailDispatch(dispatch) {
-    const response = await fetch(CONFIG.APPS_SCRIPT_URL, {
-        method: 'POST',
-        headers: { 'Content-Type': 'text/plain' },
-        body: JSON.stringify({
-            action: 'sendEmails',
-            to: dispatch.to,
-            subject: dispatch.subject,
-            htmlBody: dispatch.htmlBody,
-            attachments: dispatch.attachments
-        })
-    });
-    const responseData = await response.json();
-    if (responseData.status !== 'ok') {
-        throw new Error(responseData.error || 'Erro desconhecido');
+function getDispatchCountForQueue(queueKey) {
+    const data = delegationQueue[queueKey];
+    if (!data || !data.items || data.items.length === 0) return 0;
+    return requiresOneEmailPerPublication(queueKey) ? data.items.length : 1;
+}
+
+function hashDispatchIdentity(value, seed) {
+    let hash = seed;
+    for (let index = 0; index < value.length; index++) {
+        hash ^= value.charCodeAt(index);
+        hash = Math.imul(hash, 0x01000193);
+    }
+    return (hash >>> 0).toString(36);
+}
+
+function createDispatchId(queueKey, dispatch) {
+    const itemIdentity = dispatch.items.map(item => item.deliveryId || item._uid || [
+        item.cnj, item.dataStr, item.idPublicacao || '', item.obs || ''
+    ].join('|')).join('||');
+    const identity = `${queueKey}::${itemIdentity}`;
+    return `forelegal-${hashDispatchIdentity(identity, 0x811c9dc5)}-${hashDispatchIdentity(identity, 0x9e3779b9)}`;
+}
+
+function waitForEmailRetry(delayMs) {
+    return new Promise(resolve => setTimeout(resolve, delayMs));
+}
+
+async function fetchWithTimeout(url, options, timeoutMs) {
+    if (typeof AbortController === 'undefined') return fetch(url, options);
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+        return await fetch(url, { ...options, signal: controller.signal });
+    } finally {
+        clearTimeout(timeout);
     }
 }
 
-async function sendMailboxEntry(queueKey) {
-    if (!CONFIG.APPS_SCRIPT_URL) {
-        throw new Error('APPS_SCRIPT_URL não configurado');
+async function postEmailDispatch(dispatch, onAttempt) {
+    const dispatchId = dispatch.dispatchId || (dispatch.dispatchId = createDispatchId(dispatch.queueKey, dispatch));
+    let lastError;
+
+    for (let attempt = 1; attempt <= EMAIL_SEND_MAX_ATTEMPTS; attempt++) {
+        if (onAttempt) onAttempt(attempt, EMAIL_SEND_MAX_ATTEMPTS);
+        try {
+            const response = await fetchWithTimeout(CONFIG.APPS_SCRIPT_URL, {
+                method: 'POST',
+                headers: { 'Content-Type': 'text/plain' },
+                body: JSON.stringify({
+                    action: 'sendEmails',
+                    dispatchId: dispatchId,
+                    to: dispatch.to,
+                    subject: dispatch.subject,
+                    htmlBody: dispatch.htmlBody,
+                    attachments: dispatch.attachments
+                })
+            }, EMAIL_REQUEST_TIMEOUT_MS);
+            if (response && response.ok === false) {
+                throw new Error(`Servidor respondeu HTTP ${response.status}`);
+            }
+
+            const responseData = await response.json();
+            if (responseData.status === 'ok') return responseData;
+            throw new Error(responseData.error || 'Erro desconhecido');
+        } catch (error) {
+            lastError = error;
+            if (attempt < EMAIL_SEND_MAX_ATTEMPTS) await waitForEmailRetry(attempt * 1500);
+        }
     }
 
+    throw lastError || new Error('Não foi possível enviar o e-mail');
+}
+
+function updateEmailSendProgress(session, detail) {
+    const overlay = document.getElementById('email-send-overlay');
+    if (!overlay) return;
+
+    const processed = Math.min(session.processed, session.total);
+    const progress = session.total ? Math.round((processed / session.total) * 100) : 0;
+    const title = document.getElementById('email-send-title');
+    const status = document.getElementById('email-send-status');
+    const bar = document.getElementById('email-send-progress-bar');
+    const count = document.getElementById('email-send-progress-count');
+    const percent = document.getElementById('email-send-progress-percent');
+    const detailElement = document.getElementById('email-send-detail');
+    const closeButton = document.getElementById('email-send-close-btn');
+
+    overlay.classList.remove('hidden');
+    if (title) title.textContent = session.finished
+        ? (session.failed.length ? 'Envio concluído com pendências' : 'Todos os e-mails foram enviados')
+        : 'Enviando e-mails...';
+    if (status) status.textContent = session.finished
+        ? (session.failed.length
+            ? `${session.sent} enviado(s) e ${session.failed.length} pendência(s). Os pendentes continuam na fila.`
+            : `${session.sent} e-mail(s) confirmado(s). A fila foi atualizada.`)
+        : 'Aguarde. Não feche ou atualize esta página durante o disparo.';
+    if (bar) bar.style.width = `${session.finished ? 100 : progress}%`;
+    if (count) count.textContent = `${processed} de ${session.total}`;
+    if (percent) percent.textContent = `${session.finished ? 100 : progress}%`;
+    if (detailElement) detailElement.textContent = detail || '';
+    if (closeButton) closeButton.classList.toggle('hidden', !session.finished);
+}
+
+function closeEmailSendProgress() {
+    if (activeEmailSend) return;
+    const overlay = document.getElementById('email-send-overlay');
+    if (overlay) overlay.classList.add('hidden');
+}
+
+function setEmailSendControls(isSending) {
+    const sendAllButton = document.getElementById('send-all-btn');
+    if (sendAllButton) sendAllButton.disabled = isSending;
+    document.querySelectorAll('.mbox-send-btn, .mbox-split-btn, .mbox-item-remove').forEach(button => {
+        button.disabled = isSending;
+    });
+}
+
+async function sendMailboxEntry(queueKey, callbacks = {}) {
+    if (!CONFIG.APPS_SCRIPT_URL) throw new Error('APPS_SCRIPT_URL não configurado');
+
     const data = delegationQueue[queueKey];
-    if (!data || data.items.length === 0) return 0;
+    if (!data || data.items.length === 0) return { sent: 0, duplicates: 0, failed: [] };
 
     const safeKey = queueKey.replace(/[^a-zA-Z0-9]/g, '_');
     const subjectInput = document.getElementById(`subject-${safeKey}`);
     const subjectOverride = requiresOneEmailPerPublication(queueKey)
         ? ''
         : (subjectInput ? subjectInput.value.trim() : '');
-    const dispatches = createEmailDispatches(queueKey, data, subjectOverride);
+    const dispatches = createEmailDispatches(queueKey, data, subjectOverride).map(dispatch => ({
+        ...dispatch,
+        queueKey: queueKey
+    }));
+    const result = { sent: 0, duplicates: 0, failed: [] };
 
-    const btn = document.getElementById(`btn-flush-${safeKey}`);
-    if (btn) btn.innerHTML = `<i data-lucide="loader" class="spin"></i> Enviando...`;
-
-    showToast(`${dispatches.length} e-mail(s) para ${data.name} em envio...`, 'info');
-
-    for (let index = 0; index < dispatches.length; index++) {
-        const dispatch = dispatches[index];
-        await postEmailDispatch(dispatch);
-
-        dispatch.items.forEach(item => {
-            saveDelegationInfo(item.cnj, [data.name], item.obs || '');
-        });
-        saveToHistory(dispatch.to, data.name, dispatch.items, dispatch.subject);
-        logDelegationToSheets(
-            dispatch.to,
-            data.name,
-            dispatch.items,
-            itemsToSimpleText(dispatch.items)
-        );
-
-        // Persistir cada sucesso individualmente. Se um envio seguinte falhar,
-        // só as publicações ainda não enviadas permanecem na fila.
-        removeDispatchedItems(queueKey, dispatch.items);
-        await saveDelegationQueue();
-
-        if (dispatches.length > 1) {
-            showToast(`E-mail ${index + 1} de ${dispatches.length} enviado para ${data.name}.`, 'info');
+    for (const dispatch of dispatches) {
+        if (callbacks.onDispatchStart) callbacks.onDispatchStart(dispatch);
+        try {
+            const responseData = await postEmailDispatch(dispatch, (attempt, maxAttempts) => {
+                if (callbacks.onDispatchAttempt) callbacks.onDispatchAttempt(dispatch, attempt, maxAttempts);
+            });
+            dispatch.items.forEach(item => saveDelegationInfo(item.cnj, [data.name], item.obs || ''));
+            saveToHistory(dispatch.to, data.name, dispatch.items, dispatch.subject);
+            logDelegationToSheets(dispatch.to, data.name, dispatch.items, itemsToSimpleText(dispatch.items));
+            removeDispatchedItems(queueKey, dispatch.items);
+            saveDelegationQueue({ syncToSheets: false });
+            result.sent++;
+            if (responseData.duplicate) result.duplicates++;
+            if (callbacks.onDispatchComplete) callbacks.onDispatchComplete(dispatch, responseData);
+        } catch (error) {
+            const failure = { dispatch: dispatch, error: error };
+            result.failed.push(failure);
+            if (callbacks.onDispatchFailed) callbacks.onDispatchFailed(failure);
         }
     }
 
-    renderMailbox();
-    return dispatches.length;
+    return result;
 }
 
-async function flushMailbox(queueKey) {
-    try {
-        const sentCount = await sendMailboxEntry(queueKey);
-        if (sentCount > 0) showToast(`✓ ${sentCount} e-mail(s) enviado(s) com sucesso!`, 'success');
-    } catch (err) {
-        console.error(err);
-        showToast(`Erro ao enviar e-mail: ${err.message}`, 'error');
-        renderMailbox();
+async function startEmailSendSession(queueKeys) {
+    if (activeEmailSend) {
+        updateEmailSendProgress(activeEmailSend, 'Já existe um lote em andamento. Aguarde a conclusão.');
+        return activeEmailSend;
     }
+
+    const keysToSend = queueKeys.filter(queueKey => getDispatchCountForQueue(queueKey) > 0);
+    const total = keysToSend.reduce((sum, queueKey) => sum + getDispatchCountForQueue(queueKey), 0);
+    if (total === 0) return null;
+
+    const session = { total: total, processed: 0, sent: 0, duplicates: 0, failed: [], finished: false };
+    activeEmailSend = session;
+    setEmailSendControls(true);
+    updateEmailSendProgress(session, `Preparando ${total} e-mail(s) para envio.`);
+
+    try {
+        for (const queueKey of keysToSend) {
+            if (!delegationQueue[queueKey] || delegationQueue[queueKey].items.length === 0) continue;
+            await sendMailboxEntry(queueKey, {
+                onDispatchStart: dispatch => updateEmailSendProgress(session, `Enviando: ${dispatch.subject}`),
+                onDispatchAttempt: (dispatch, attempt, maxAttempts) => {
+                    if (attempt > 1) updateEmailSendProgress(session, `Tentativa ${attempt} de ${maxAttempts}: ${dispatch.subject}`);
+                },
+                onDispatchComplete: (dispatch, responseData) => {
+                    session.processed++;
+                    session.sent++;
+                    if (responseData.duplicate) session.duplicates++;
+                    updateEmailSendProgress(session, responseData.duplicate
+                        ? `Confirmado sem reenvio: ${dispatch.subject}`
+                        : `Enviado: ${dispatch.subject}`);
+                },
+                onDispatchFailed: failure => {
+                    session.processed++;
+                    session.failed.push(failure);
+                    updateEmailSendProgress(session, `Pendente após 3 tentativas: ${failure.dispatch.subject}`);
+                }
+            });
+        }
+    } catch (error) {
+        console.error('[E-mail] Falha inesperada no lote:', error);
+        session.failed.push({ error: error });
+    } finally {
+        await saveDelegationQueue();
+        session.finished = true;
+        activeEmailSend = null;
+        setEmailSendControls(false);
+        renderMailbox();
+        updateEmailSendProgress(session, session.failed.length
+            ? 'Os e-mails pendentes continuam na fila para uma nova tentativa.'
+            : 'Envio finalizado. Você já pode fechar esta janela.');
+        if (session.failed.length) {
+            showToast(`${session.sent} e-mail(s) enviado(s); ${session.failed.length} permaneceram pendentes.`, 'error');
+        } else {
+            showToast(`✓ ${session.sent} e-mail(s) enviado(s) com sucesso!`, 'success');
+        }
+    }
+
+    return session;
+}
+
+function flushMailbox(queueKey) {
+    return startEmailSendSession([queueKey]);
 }
 
 function itemsToSimpleText(items) {
     return items.map(i => `${i.cnj} - ${i.obs || ''}`).join(' | ');
 }
 
-// Versão async do flushMailbox para uso sequencial no flushAllMailbox
-async function flushMailboxAsync(queueKey) {
-    try {
-        const sentCount = await sendMailboxEntry(queueKey);
-        if (sentCount > 0) showToast(`✓ ${sentCount} e-mail(s) enviado(s) com sucesso!`, 'success');
-    } catch (err) {
-        showToast(`Erro ao enviar e-mail: ${err.message}`, 'error');
-        renderMailbox();
-        throw err;
-    }
-}
-
-// Botao de Enviar Todos — sequencial para evitar duplicação
+// Botão de Enviar Todos — uma única sessão, sequencial e visível ao usuário.
 async function flushAllMailbox() {
+    if (activeEmailSend) {
+        updateEmailSendProgress(activeEmailSend, 'Já existe um lote em andamento. Aguarde a conclusão.');
+        return;
+    }
     if (Object.keys(delegationQueue).length === 0) return;
     
     if (!confirm('Deseja enviar todos os e-mails da fila pendente de uma vez?')) return;
-    
-    showToast('Iniciando envio em lote...', 'info');
-    
-    // Capturar as chaves ANTES de iniciar (snapshot)
-    const keysToSend = Object.keys(delegationQueue).slice();
-    
-    for (const queueKey of keysToSend) {
-        // Verificar se ainda existe na fila (pode ter sido removido pelo envio anterior)
-        if (!delegationQueue[queueKey] || delegationQueue[queueKey].items.length === 0) {
-            continue;
-        }
-        try {
-            await flushMailboxAsync(queueKey);
-        } catch (err) {
-            console.error(`Erro ao enviar para ${queueKey}:`, err);
-        }
-    }
-    
-    showToast('Envio em lote concluído!', 'success');
+
+    return startEmailSendSession(Object.keys(delegationQueue).slice());
 }
 
 function downloadBase64File(dataUrl, filename) {

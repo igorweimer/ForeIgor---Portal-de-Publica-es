@@ -301,6 +301,24 @@
         <p>Sincronizando com a planilha...</p>
     </div>
 
+    <!-- Progresso de envio: bloqueia novos disparos enquanto o lote está em andamento -->
+    <div class="email-send-overlay hidden" id="email-send-overlay" role="dialog" aria-modal="true" aria-labelledby="email-send-title">
+        <div class="email-send-dialog">
+            <div class="email-send-icon"><i data-lucide="send"></i></div>
+            <h2 id="email-send-title">Preparando envio...</h2>
+            <p id="email-send-status">Aguarde. Não feche ou atualize esta página durante o disparo.</p>
+            <div class="email-send-progress-track" aria-label="Progresso do envio">
+                <div class="email-send-progress-bar" id="email-send-progress-bar"></div>
+            </div>
+            <div class="email-send-progress-meta">
+                <strong id="email-send-progress-count">0 de 0</strong>
+                <span id="email-send-progress-percent">0%</span>
+            </div>
+            <p class="email-send-detail" id="email-send-detail"></p>
+            <button class="email-send-close-btn hidden" id="email-send-close-btn" onclick="closeEmailSendProgress()">Fechar</button>
+        </div>
+    </div>
+
     <!-- Modal Caixa de Saída / Fila (REDESENHADO) -->
     <div class="overlay hidden" id="mailbox-modal" onclick="if(event.target===this) closeMailbox()">
         <div class="mailbox-modal-container">
@@ -338,7 +356,7 @@
     </div>
     <div class="history-overlay hidden" id="history-overlay" onclick="toggleHistoryPanel()"></div>
 
-    <script src="script.js?v=6"></script>
+    <script src="script.js?v=7"></script>
     <script>lucide.createIcons();</script>
 </body>
 </html>
