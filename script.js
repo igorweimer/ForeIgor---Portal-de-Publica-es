@@ -2597,6 +2597,16 @@ function waitForEmailRetry(delayMs) {
     return new Promise(resolve => setTimeout(resolve, delayMs));
 }
 
+function promiseWithTimeout(promise, timeoutMs, label) {
+    return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error(`Timeout: ${label || 'operação'} excedeu ${Math.round(timeoutMs / 1000)}s`)), timeoutMs);
+        promise.then(
+            value => { clearTimeout(timer); resolve(value); },
+            error => { clearTimeout(timer); reject(error); }
+        );
+    });
+}
+
 async function fetchWithTimeout(url, options, timeoutMs) {
     if (typeof AbortController === 'undefined') return fetch(url, options);
     const controller = new AbortController();
@@ -2636,14 +2646,31 @@ async function postEmailDispatch(dispatch, onAttempt) {
             throw new Error(responseData.error || 'Erro desconhecido');
         } catch (error) {
             lastError = error;
-            if (attempt < EMAIL_SEND_MAX_ATTEMPTS) await waitForEmailRetry(attempt * 1500);
+            if (attempt < EMAIL_SEND_MAX_ATTEMPTS) await waitForEmailRetry(attempt * 2000);
         }
     }
 
-    throw lastError || new Error('Não foi possível enviar o e-mail');
+    throw lastError || new Error('Não foi possível confirmar o envio do e-mail após 3 tentativas');
 }
 
-function updateEmailSendProgress(session, detail) {
+/**
+ * Monta texto descritivo de um dispatch falho para exibição no modal.
+ * Formato: assunto do e-mail + lista de CNJs com observações.
+ */
+function buildFailedDispatchDetail(failure) {
+    const dispatch = failure.dispatch;
+    if (!dispatch) return 'Erro desconhecido no envio.';
+    const subject = dispatch.subject || '(sem assunto)';
+    const items = dispatch.items || [];
+    const lines = [`📧 E-mail pendente: "${subject}"`, ''];
+    items.forEach(item => {
+        const obs = item.obs && item.obs !== 'Sem instrução — clique para editar' ? ` — ${item.obs}` : '';
+        lines.push(`• ${item.cnj}${obs}`);
+    });
+    return lines.join('\n');
+}
+
+function updateEmailSendProgress(session, detail, detailIsHtml) {
     const overlay = document.getElementById('email-send-overlay');
     if (!overlay) return;
 
@@ -2658,23 +2685,35 @@ function updateEmailSendProgress(session, detail) {
     const closeButton = document.getElementById('email-send-close-btn');
 
     overlay.classList.remove('hidden');
+
     if (title) title.textContent = session.finished
-        ? (session.failed.length ? 'Envio concluído com pendências' : 'Todos os e-mails foram enviados')
+        ? (session.failed.length ? 'Envio concluído com pendências' : 'Todos os e-mails foram enviados!')
         : 'Enviando e-mails...';
+
     if (status) status.textContent = session.finished
         ? (session.failed.length
-            ? `${session.sent} enviado(s) e ${session.failed.length} pendência(s). Os pendentes continuam na fila.`
+            ? `${session.sent} enviado(s) com sucesso · ${session.failed.length} pendente(s) na fila. Verifique abaixo e no Gmail.`
             : `${session.sent} e-mail(s) confirmado(s). A fila foi atualizada.`)
         : 'Aguarde. Não feche ou atualize esta página durante o disparo.';
+
     if (bar) bar.style.width = `${session.finished ? 100 : progress}%`;
     if (count) count.textContent = `${processed} de ${session.total}`;
     if (percent) percent.textContent = `${session.finished ? 100 : progress}%`;
-    if (detailElement) detailElement.textContent = detail || '';
+
+    if (detailElement) {
+        detailElement.textContent = detail || '';
+        // Aplicar classe de destaque quando mostramos conteúdo de e-mail pendente
+        detailElement.classList.toggle('has-failures', Boolean(session.finished && session.failed.length && detail));
+    }
+
+    // Botão fechar: SEMPRE visível quando a sessão terminou
     if (closeButton) closeButton.classList.toggle('hidden', !session.finished);
 }
 
 function closeEmailSendProgress() {
-    if (activeEmailSend) return;
+    // Permitir fechar se não houver envio ativo OU se a sessão já terminou
+    if (activeEmailSend && !activeEmailSend.finished) return;
+    activeEmailSend = null;
     const overlay = document.getElementById('email-send-overlay');
     if (overlay) overlay.classList.add('hidden');
 }
@@ -2743,6 +2782,21 @@ async function startEmailSendSession(queueKeys) {
     setEmailSendControls(true);
     updateEmailSendProgress(session, `Preparando ${total} e-mail(s) para envio.`);
 
+    // Safety timeout: garante que a sessão será finalizada mesmo que algo pendure.
+    // Tempo = (total de dispatches × timeout por tentativa × tentativas) + margem de 60s
+    const maxSessionMs = (total * EMAIL_REQUEST_TIMEOUT_MS * EMAIL_SEND_MAX_ATTEMPTS) + 60000;
+    const safetyTimer = setTimeout(() => {
+        if (activeEmailSend === session && !session.finished) {
+            console.warn('[E-mail] Safety timeout atingido — finalizando sessão à força.');
+            session.finished = true;
+            activeEmailSend = null;
+            setEmailSendControls(false);
+            renderMailbox();
+            updateEmailSendProgress(session, 'Sessão encerrada por tempo limite. Verifique a caixa de saída do Gmail.');
+            showToast(`Sessão de envio encerrada. ${session.sent} confirmado(s), ${session.failed.length} pendente(s).`, 'error');
+        }
+    }, maxSessionMs);
+
     try {
         for (const queueKey of keysToSend) {
             if (!delegationQueue[queueKey] || delegationQueue[queueKey].items.length === 0) continue;
@@ -2762,7 +2816,8 @@ async function startEmailSendSession(queueKeys) {
                 onDispatchFailed: failure => {
                     session.processed++;
                     session.failed.push(failure);
-                    updateEmailSendProgress(session, `Pendente após 3 tentativas: ${failure.dispatch.subject}`);
+                    // Mostrar o conteúdo completo do e-mail que falhou para facilitar verificação manual
+                    updateEmailSendProgress(session, buildFailedDispatchDetail(failure));
                 }
             });
         }
@@ -2770,19 +2825,31 @@ async function startEmailSendSession(queueKeys) {
         console.error('[E-mail] Falha inesperada no lote:', error);
         session.failed.push({ error: error });
     } finally {
-        await saveDelegationQueue();
+        clearTimeout(safetyTimer);
+        // Salvar fila com proteção contra travamento — não pode impedir a finalização
+        try {
+            await promiseWithTimeout(saveDelegationQueue(), 15000, 'salvar fila na planilha');
+        } catch (saveError) {
+            console.warn('[E-mail] Não foi possível salvar fila na planilha (continuando):', saveError.message);
+        }
         session.finished = true;
         activeEmailSend = null;
         setEmailSendControls(false);
         renderMailbox();
-        updateEmailSendProgress(session, session.failed.length
-            ? 'Os e-mails pendentes continuam na fila para uma nova tentativa.'
-            : 'Envio finalizado. Você já pode fechar esta janela.');
-        if (session.failed.length) {
-            showToast(`${session.sent} e-mail(s) enviado(s); ${session.failed.length} permaneceram pendentes.`, 'error');
+
+        // Se há falhas, montar detalhe completo de todos os e-mails pendentes para o modal
+        let finalDetail = '';
+        if (session.failed.length > 0) {
+            finalDetail = session.failed
+                .filter(f => f.dispatch) // ignora erros sem dispatch (falha interna)
+                .map(f => buildFailedDispatchDetail(f))
+                .join('\n\n');
+            showToast(`${session.sent} enviado(s); ${session.failed.length} pendente(s) — verifique o modal.`, 'error');
         } else {
+            finalDetail = 'Envio finalizado. Você já pode fechar esta janela.';
             showToast(`✓ ${session.sent} e-mail(s) enviado(s) com sucesso!`, 'success');
         }
+        updateEmailSendProgress(session, finalDetail);
     }
 
     return session;

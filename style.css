@@ -1395,6 +1395,23 @@ body {
 .email-send-detail {
     min-height: 22px;
     margin-top: 18px !important;
+    white-space: pre-line;
+    text-align: left;
+    font-size: 0.82rem;
+    color: #475569;
+    line-height: 1.6;
+}
+
+.email-send-detail.has-failures {
+    background: #fef9ec;
+    border: 1px solid #f59e0b;
+    border-radius: 8px;
+    padding: 12px 14px;
+    color: #92400e;
+    font-family: 'Inter', monospace;
+    font-size: 0.80rem;
+    max-height: 220px;
+    overflow-y: auto;
 }
 
 .email-send-close-btn {
