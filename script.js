@@ -1861,6 +1861,7 @@ try {
 
 async function loadEmailQueueFromSheets() {
     if (!CONFIG.APPS_SCRIPT_URL) return;
+    if (activeEmailSend) return; // Bloqueia a sincronização de fila se estivermos no meio de um disparo
     try {
         const res = await fetch(CONFIG.APPS_SCRIPT_URL + `?action=getEmailQueue&t=${Date.now()}`);
         const data = await res.json();
@@ -2565,8 +2566,8 @@ function removeDispatchedItems(queueKey, dispatchedItems) {
     const current = delegationQueue[queueKey];
     if (!current) return;
 
-    const sentItems = new Set(dispatchedItems);
-    current.items = current.items.filter(item => !sentItems.has(item));
+    const sentIds = new Set(dispatchedItems.map(item => item._uid || item.cnj));
+    current.items = current.items.filter(item => !sentIds.has(item._uid || item.cnj));
     if (current.items.length === 0) delete delegationQueue[queueKey];
 }
 
