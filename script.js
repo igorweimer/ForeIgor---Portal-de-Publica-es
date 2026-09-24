@@ -23,7 +23,7 @@ const ONE_EMAIL_PER_PUBLICATION_RECIPIENTS = new Set([
 ]);
 
 const EMAIL_SEND_MAX_ATTEMPTS = 3;
-const EMAIL_REQUEST_TIMEOUT_MS = 90 * 1000;
+const EMAIL_REQUEST_TIMEOUT_MS = 150 * 1000; // 2.5 min — Apps Script pode demorar bastante
 let activeEmailSend = null;
 let emailQueueSyncChain = Promise.resolve();
 
@@ -1541,8 +1541,8 @@ function updateCounters() {
     const total = filteredPublications.length;
     const unread = filteredPublications.filter(p => p.status !== 'LIDO' && p.status !== 'DESCONSIDERADO').length;
     const read = filteredPublications.filter(p => p.status === 'LIDO').length;
-    // "Novas" é sempre calculado sobre TODAS as publicações, não só as filtradas
-    const newCount = allPublications.filter(p => p.isNew).length;
+    // "Novas" respeita os filtros ativos (área, empreendimento, período, etc.)
+    const newCount = filteredPublications.filter(p => p.isNew).length;
 
     animateCounter('count-total', total);
     animateCounter('count-unread', unread);
@@ -2646,7 +2646,7 @@ async function postEmailDispatch(dispatch, onAttempt) {
             throw new Error(responseData.error || 'Erro desconhecido');
         } catch (error) {
             lastError = error;
-            if (attempt < EMAIL_SEND_MAX_ATTEMPTS) await waitForEmailRetry(attempt * 2000);
+            if (attempt < EMAIL_SEND_MAX_ATTEMPTS) await waitForEmailRetry(attempt * 5000); // 5s, 10s — dar tempo ao lock do Apps Script
         }
     }
 
