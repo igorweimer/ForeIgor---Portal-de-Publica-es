@@ -26,6 +26,8 @@ const EMAIL_SEND_MAX_ATTEMPTS = 3;
 const EMAIL_REQUEST_TIMEOUT_MS = 150 * 1000; // 2.5 min — Apps Script pode demorar bastante
 let activeEmailSend = null;
 let emailQueueSyncChain = Promise.resolve();
+let publicationsFetchInFlight = null;
+let emailQueueRevision = null;
 
 function createDeliveryId() {
     if (window.crypto && typeof window.crypto.randomUUID === 'function') {
@@ -210,29 +212,59 @@ function askConfirmRead(msg, callback) {
 }
 
 // ─────────── FETCH DATA ───────────
-async function fetchPublications() {
+function fetchPublications() {
+    if (publicationsFetchInFlight) {
+        console.info('[Sync] Atualização já em andamento; ignorando gatilho sobreposto.');
+        return publicationsFetchInFlight;
+    }
+    publicationsFetchInFlight = fetchPublicationsOnce().finally(() => {
+        publicationsFetchInFlight = null;
+    });
+    return publicationsFetchInFlight;
+}
+
+async function fetchPublicationsOnce() {
+    const startedAt = Date.now();
     // Se o usuário está interagindo (lendo publicação, mailbox, editando),
     // atualiza os dados em memória mas NÃO toca no DOM — zero flicker.
     if (isUserBusy()) {
         try {
             const cacheBust = `?t=${Date.now()}`;
+            const fetchStartedAt = Date.now();
             const response = await fetch(CONFIG.APPS_SCRIPT_URL + cacheBust);
+            const fetchMs = Date.now() - fetchStartedAt;
+            if (response && response.ok === false) throw new Error(`HTTP ${response.status}`);
+            const parseStartedAt = Date.now();
             const data = await response.json();
+            const parseMs = Date.now() - parseStartedAt;
+            const normalizeStartedAt = Date.now();
             allPublications = data.map(normalizePublication);
+            const normalizeMs = Date.now() - normalizeStartedAt;
             detectNewPublications();
             setSyncStatus('ok', 'Conectado');
-        } catch(e) { /* silencioso */ }
+            console.info(`[Sync] busy rows=${allPublications.length} fetch=${fetchMs}ms parse=${parseMs}ms normalize=${normalizeMs}ms total=${Date.now() - startedAt}ms`);
+        } catch(e) { console.warn('[Sync] Atualização durante interação falhou:', e.message); }
         return;
     }
 
     setSyncStatus('loading', 'Sincronizando...');
 
     try {
+        let fetchMs = 0;
+        let parseMs = 0;
+        let normalizeMs = 0;
         if (CONFIG.APPS_SCRIPT_URL) {
             const cacheBust = `?t=${Date.now()}`;
+            const fetchStartedAt = Date.now();
             const response = await fetch(CONFIG.APPS_SCRIPT_URL + cacheBust);
+            fetchMs = Date.now() - fetchStartedAt;
+            if (response && response.ok === false) throw new Error(`HTTP ${response.status}`);
+            const parseStartedAt = Date.now();
             const data = await response.json();
+            parseMs = Date.now() - parseStartedAt;
+            const normalizeStartedAt = Date.now();
             allPublications = data.map(normalizePublication);
+            normalizeMs = Date.now() - normalizeStartedAt;
         } else {
             allPublications = await fetchViaGoogleViz();
         }
@@ -245,6 +277,7 @@ async function fetchPublications() {
         populateFilterDropdowns();
         updateCounters();
         setSyncStatus('ok', 'Conectado');
+        console.info(`[Sync] rows=${allPublications.length} fetch=${fetchMs}ms parse=${parseMs}ms normalize=${normalizeMs}ms render=${Date.now() - startedAt - fetchMs - parseMs - normalizeMs}ms total=${Date.now() - startedAt}ms`);
     } catch (err) {
         console.error('Erro ao buscar publicações:', err);
         setSyncStatus('error', 'Sem internet / ' + (err.message || 'Erro desconhecido'));
@@ -479,22 +512,26 @@ async function fetchViaGoogleViz() {
 
         const cnjStr2 = String(cnj).trim();
         
-        // UID DETERMINÍSTICO: idPub + CNJ + hash do teor
-        // Isso garante que o UID seja idêntico entre reloads e sincronizações
-        const _teorHash = String(textoPub || '').length;
-        const _uid = `${idPub || 'noid'}_${cnjStr2}_${_teorHash}`;
+        // UID estável por publicação: usa o texto completo para distinguir duas
+        // publicações do mesmo processo que tenham o mesmo tamanho.
+        const _legacyUid = `${idPub || 'noid'}_${cnjStr2}_${String(textoPub || '').length}`;
+        const _uid = createStablePublicationUid(idPub, cnjStr2, dataStr, tipoPub, textoPub);
 
         // Status precedence: Locked > Optimistic > Planilha
         let rawStatus = String(statusSpreadsheet).trim().toUpperCase();
         let finalStatus;
 
         // 1. LOCKED (cimento e concreto): status travado pelo usuário — imutável até desmarcar manualmente
-        if (lockedStatuses[_uid]) {
-            finalStatus = lockedStatuses[_uid].status;
+        if (lockedStatuses[_uid] || lockedStatuses[_legacyUid]) {
+            finalStatus = (lockedStatuses[_uid] || lockedStatuses[_legacyUid]).status;
+            if (!lockedStatuses[_uid] && lockedStatuses[_legacyUid]) {
+                lockedStatuses[_uid] = lockedStatuses[_legacyUid];
+                saveLockedStatuses();
+            }
         }
         // 2. OPTIMISTIC: mudança local ainda não confirmada pelo servidor
-        else if (optimisticUpdates[_uid] || optimisticUpdates[cnjStr2]) {
-            finalStatus = (optimisticUpdates[_uid] || optimisticUpdates[cnjStr2]).status;
+        else if (optimisticUpdates[_uid] || optimisticUpdates[_legacyUid] || optimisticUpdates[cnjStr2]) {
+            finalStatus = (optimisticUpdates[_uid] || optimisticUpdates[_legacyUid] || optimisticUpdates[cnjStr2]).status;
         }
         // 3. PLANILHA: fonte da verdade remota
         else {
@@ -524,6 +561,8 @@ async function fetchViaGoogleViz() {
         const orgaoFinal = orgao || (detectedTribunal ? detectedTribunal.nome : '');
         publications.push({
             _uid: _uid,
+            _legacyUid: _legacyUid,
+            _deliveryUid: createStablePublicationUid(idPub, cnjStr2, dataStr, tipoPub, textoPub),
             dataDisponibilizacao: dataStr, // Alias para sort actions
             dataStr: dataStr,
             cnj: cnj,
@@ -680,20 +719,24 @@ function normalizePublication(row) {
     // --- Status (Sheets-First — PLANILHA É A ÚNICA FONTE DA VERDADE) ---
     const _cnjNorm = String(cnj).trim();
     const idPubRaw = row['Id Publicação'] || row.idPublicacao || '';
-    const _teorHash = String(textoPub || '').length;
-    const _uid = `${idPubRaw || 'noid'}_${_cnjNorm}_${_teorHash}`;
+    const _legacyUid = `${idPubRaw || 'noid'}_${_cnjNorm}_${String(textoPub || '').length}`;
+    const _uid = createStablePublicationUid(idPubRaw, _cnjNorm, dataStr, row['Tipo Publicação Tribunal'] || row.tipoPublicacao || '', textoPub);
 
     // --- Status (Prioridade: Locked > Optimistic > Planilha) ---
     let rawStatus = String(row.Status || row.status || '').trim().toUpperCase();
     let finalStatus;
 
     // 1. LOCKED (cimento e concreto): status travado pelo usuário — imutável até desmarcar manualmente
-    if (lockedStatuses[_uid]) {
-        finalStatus = lockedStatuses[_uid].status;
+    if (lockedStatuses[_uid] || lockedStatuses[_legacyUid]) {
+        finalStatus = (lockedStatuses[_uid] || lockedStatuses[_legacyUid]).status;
+        if (!lockedStatuses[_uid] && lockedStatuses[_legacyUid]) {
+            lockedStatuses[_uid] = lockedStatuses[_legacyUid];
+            saveLockedStatuses();
+        }
     }
     // 2. OPTIMISTIC: mudança local ainda não confirmada pelo servidor
-    else if (optimisticUpdates[_uid] || optimisticUpdates[_cnjNorm]) {
-        finalStatus = (optimisticUpdates[_uid] || optimisticUpdates[_cnjNorm]).status;
+    else if (optimisticUpdates[_uid] || optimisticUpdates[_legacyUid] || optimisticUpdates[_cnjNorm]) {
+        finalStatus = (optimisticUpdates[_uid] || optimisticUpdates[_legacyUid] || optimisticUpdates[_cnjNorm]).status;
     }
     // 3. PLANILHA: fonte da verdade remota
     else {
@@ -719,6 +762,8 @@ function normalizePublication(row) {
     }
     return {
         _uid: _uid,
+        _legacyUid: _legacyUid,
+        _deliveryUid: createStablePublicationUid(idPubRaw, _cnjNorm, dataStr, row['Tipo Publicação Tribunal'] || row.tipoPublicacao || '', textoPub),
         dataDisponibilizacao: dataStr,
         dataStr: dataStr,
         cnj: cnj,
@@ -839,7 +884,8 @@ async function processSyncQueue() {
             body: JSON.stringify({ action: 'updateStatusBatch', updates: batch }),
         });
         
-        if (res.ok) {
+        const result = await res.json();
+        if (res.ok && result && result.status === 'ok') {
             console.log(`[Sync] ✓ Lote de ${batch.length} salvo com sucesso na planilha.`);
 
             // Remove da fila apenas os itens enviados
@@ -861,7 +907,7 @@ async function processSyncQueue() {
 
             setSyncStatus('ok', 'Conectado');
         } else {
-            console.warn(`[Sync] ✗ Resposta não-OK da planilha no lote.`);
+            console.warn(`[Sync] ✗ Planilha recusou lote de status: ${result && (result.error || result.status) || res.status}`);
             setSyncStatus('error', 'Sem internet / Falha ao sincronizar');
         }
     } catch (err) {
@@ -1323,7 +1369,7 @@ async function bulkMarkAs(isReadStatus) {
         const pub = allPublications.find(p => p._uid === _uid);
         if (pub) {
             pub.status = newStatus;
-            setStatus(pub.cnj, newStatus, pub._uid);
+            setStatus(pub.cnj, newStatus, pub._uid, pub.idPublicacao);
         }
     });
     
@@ -1866,6 +1912,7 @@ async function loadEmailQueueFromSheets() {
         const res = await fetch(CONFIG.APPS_SCRIPT_URL + `?action=getEmailQueue&t=${Date.now()}`);
         const data = await res.json();
         if (data && data.queue) {
+            if (Number.isInteger(Number(data.revision))) emailQueueRevision = Number(data.revision);
             // Mesclar com fila local (arquivos base64 ficam apenas localmente)
             const sheetsQueue = data.queue;
             for (const key in sheetsQueue) {
@@ -1902,14 +1949,24 @@ function createEmailQueueSnapshot() {
 async function saveEmailQueueToSheets(queueSnapshot) {
     if (!CONFIG.APPS_SCRIPT_URL) return;
     try {
-        await fetch(CONFIG.APPS_SCRIPT_URL, {
+        const response = await fetch(CONFIG.APPS_SCRIPT_URL, {
             method: 'POST',
             headers: { 'Content-Type': 'text/plain' },
-            body: JSON.stringify({ action: 'saveEmailQueue', queue: queueSnapshot || createEmailQueueSnapshot() })
+            body: JSON.stringify({
+                action: 'saveEmailQueue',
+                queue: queueSnapshot || createEmailQueueSnapshot(),
+                expectedRevision: emailQueueRevision
+            })
         });
+        if (response && response.ok === false) throw new Error(`HTTP ${response.status}`);
+        const result = await response.json();
+        if (result.status !== 'ok') throw new Error(result.error || 'Resposta inválida ao salvar fila');
+        if (Number.isInteger(Number(result.revision))) emailQueueRevision = Number(result.revision);
         console.log('[Queue] Fila de e-mails sincronizada com a planilha.');
+        return true;
     } catch (e) {
         console.warn('[Queue] Não foi possível salvar fila na planilha:', e.message);
+        throw e;
     }
 }
 
@@ -1989,7 +2046,7 @@ function addToDelegationQueue(btn, _uid) {
             delegationQueue[groupKey] = { name: groupName, isGroup: true, items: [] };
         }
 
-        const existing = delegationQueue[groupKey].items.findIndex(item => item._uid === _uid);
+        const existing = delegationQueue[groupKey].items.findIndex(item => item._uid === _uid || (pub._legacyUid && item._uid === pub._legacyUid));
         if (existing !== -1) {
             delegationQueue[groupKey].items[existing].obs = obs;
             delegationQueue[groupKey].items[existing].files = files;
@@ -1997,7 +2054,9 @@ function addToDelegationQueue(btn, _uid) {
             delegationQueue[groupKey].items.push({
                 cnj: pub.cnj,
                 _uid: _uid,
+                deliveryPublicationKey: pub._deliveryUid || _uid,
                 deliveryId: createDeliveryId(),
+                idPublicacao: pub.idPublicacao || '',
                 orgao: pub.orgaoExpedidor,
                 tipo: pub.tipoPublicacao,
                 dataStr: pub.dataStr || pub.dataDisponibilizacao || '',
@@ -2014,16 +2073,18 @@ function addToDelegationQueue(btn, _uid) {
             delegationQueue[email] = { name: name, items: [] };
         }
 
-        const existing = delegationQueue[email].items.findIndex(item => item._uid === _uid);
+        const existing = delegationQueue[email].items.findIndex(item => item._uid === _uid || (pub._legacyUid && item._uid === pub._legacyUid));
         if (existing !== -1) {
             delegationQueue[email].items[existing].obs = obs;
             delegationQueue[email].items[existing].files = files;
         } else {
-            delegationQueue[email].items.push({ 
-                cnj: pub.cnj, 
+            delegationQueue[email].items.push({
+                cnj: pub.cnj,
                 _uid: _uid,
+                deliveryPublicationKey: pub._deliveryUid || _uid,
                 deliveryId: createDeliveryId(),
-                orgao: pub.orgaoExpedidor, 
+                idPublicacao: pub.idPublicacao || '',
+                orgao: pub.orgaoExpedidor,
                 tipo: pub.tipoPublicacao,
                 dataStr: pub.dataStr || pub.dataDisponibilizacao || '',
                 obs: obs,
@@ -2155,11 +2216,13 @@ function addToMailboxInline(_uid) {
             delegationQueue[groupKey] = { name: groupName, isGroup: true, items: [] };
         }
         
-        const alreadyExists = delegationQueue[groupKey].items.some(it => it._uid === _uid);
+        const alreadyExists = delegationQueue[groupKey].items.some(it => it._uid === _uid || (pub._legacyUid && it._uid === pub._legacyUid));
         if (!alreadyExists) {
             delegationQueue[groupKey].items.push({
                 cnj: pub.cnj,
                 _uid: _uid,
+                deliveryPublicationKey: pub._deliveryUid || _uid,
+                idPublicacao: pub.idPublicacao || '',
                 orgao: pub.orgaoExpedidor,
                 tipo: pub.tipoPublicacao,
                 dataStr: pub.dataStr || pub.dataDisponibilizacao || '',
@@ -2179,11 +2242,13 @@ function addToMailboxInline(_uid) {
             delegationQueue[email] = { name: nome, items: [] };
         }
         
-        const alreadyExists = delegationQueue[email].items.some(it => it._uid === _uid);
+        const alreadyExists = delegationQueue[email].items.some(it => it._uid === _uid || (pub._legacyUid && it._uid === pub._legacyUid));
         if (!alreadyExists) {
             delegationQueue[email].items.push({
                 cnj: pub.cnj,
                 _uid: _uid,
+                deliveryPublicationKey: pub._deliveryUid || _uid,
+                idPublicacao: pub.idPublicacao || '',
                 orgao: pub.orgaoExpedidor,
                 tipo: pub.tipoPublicacao,
                 dataStr: pub.dataStr || pub.dataDisponibilizacao || '',
@@ -2587,11 +2652,35 @@ function hashDispatchIdentity(value, seed) {
 }
 
 function createDispatchId(queueKey, dispatch) {
-    const itemIdentity = dispatch.items.map(item => item.deliveryId || item._uid || [
-        item.cnj, item.dataStr, item.idPublicacao || '', item.obs || ''
-    ].join('|')).join('||');
-    const identity = `${queueKey}::${itemIdentity}`;
+    const recipients = getRecipientEmails(queueKey).sort().join(',');
+    const itemIdentity = dispatch.items
+        .map(item => item.deliveryPublicationKey || item._deliveryUid || item._uid || [item.cnj, item.dataStr, item.idPublicacao || ''].join('|'))
+        .sort()
+        .join('||');
+    // Assunto, observação, anexos e deliveryId aleatório não alteram a identidade
+    // de entrega da mesma publicação para o mesmo destinatário.
+    const identity = `email::${recipients}::${itemIdentity}`;
     return `forelegal-${hashDispatchIdentity(identity, 0x811c9dc5)}-${hashDispatchIdentity(identity, 0x9e3779b9)}`;
+}
+
+function createDeliveryKeys(queueKey, dispatch) {
+    const recipients = getRecipientEmails(queueKey);
+    return dispatch.items.flatMap(item => recipients.map(recipient => {
+        const publicationIdentity = item.deliveryPublicationKey || item._deliveryUid || item._uid || [item.cnj, item.dataStr, item.idPublicacao || ''].join('|');
+        const identity = `email::${recipient}::${publicationIdentity}`;
+        return `delivery-${hashDispatchIdentity(identity, 0x811c9dc5)}-${hashDispatchIdentity(identity, 0x9e3779b9)}`;
+    }));
+}
+
+function createStablePublicationUid(idPublicacao, cnj, dataStr, tipo, texto) {
+    const identity = JSON.stringify([
+        String(idPublicacao || '').trim(),
+        String(cnj || '').trim(),
+        String(dataStr || '').trim(),
+        String(tipo || '').trim().toUpperCase(),
+        String(texto || '')
+    ]);
+    return `publication-${hashDispatchIdentity(identity, 0x811c9dc5)}-${hashDispatchIdentity(identity, 0x9e3779b9)}`;
 }
 
 function waitForEmailRetry(delayMs) {
@@ -2624,6 +2713,7 @@ async function postEmailDispatch(dispatch, onAttempt) {
     let lastError;
 
     for (let attempt = 1; attempt <= EMAIL_SEND_MAX_ATTEMPTS; attempt++) {
+        const attemptStartedAt = Date.now();
         if (onAttempt) onAttempt(attempt, EMAIL_SEND_MAX_ATTEMPTS);
         try {
             const response = await fetchWithTimeout(CONFIG.APPS_SCRIPT_URL, {
@@ -2632,6 +2722,10 @@ async function postEmailDispatch(dispatch, onAttempt) {
                 body: JSON.stringify({
                     action: 'sendEmails',
                     dispatchId: dispatchId,
+                    attempt: attempt,
+                    deliveryKeys: dispatch.deliveryKeys,
+                    queueKey: dispatch.queueKey,
+                    sentPublicationKeys: dispatch.items.map(item => item.deliveryPublicationKey || item._deliveryUid || item._uid || item.cnj),
                     to: dispatch.to,
                     subject: dispatch.subject,
                     htmlBody: dispatch.htmlBody,
@@ -2643,10 +2737,22 @@ async function postEmailDispatch(dispatch, onAttempt) {
             }
 
             const responseData = await response.json();
-            if (responseData.status === 'ok') return responseData;
+            if (responseData.status === 'ok') {
+                console.info(`[Email] dispatch=${dispatchId} attempt=${attempt} result=${responseData.duplicate ? 'duplicate' : 'accepted'} duration=${Date.now() - attemptStartedAt}ms`);
+                return responseData;
+            }
+            if (responseData.status === 'review_required') {
+                console.warn(`[Email] dispatch=${dispatchId} attempt=${attempt} result=review_required duration=${Date.now() - attemptStartedAt}ms`);
+                const reviewError = new Error(responseData.error || 'Envio com resultado incerto; requer reconciliação.');
+                reviewError.code = 'SEND_REVIEW_REQUIRED';
+                reviewError.dispatchId = responseData.dispatchId || dispatchId;
+                throw reviewError;
+            }
             throw new Error(responseData.error || 'Erro desconhecido');
         } catch (error) {
             lastError = error;
+            console.warn(`[Email] dispatch=${dispatchId} attempt=${attempt} result=error duration=${Date.now() - attemptStartedAt}ms code=${error && error.code || 'request_error'}`);
+            if (error && error.code === 'SEND_REVIEW_REQUIRED') break;
             if (attempt < EMAIL_SEND_MAX_ATTEMPTS) await waitForEmailRetry(attempt * 5000); // 5s, 10s — dar tempo ao lock do Apps Script
         }
     }
@@ -2663,7 +2769,7 @@ function buildFailedDispatchDetail(failure) {
     if (!dispatch) return 'Erro desconhecido no envio.';
     const subject = dispatch.subject || '(sem assunto)';
     const items = dispatch.items || [];
-    const lines = [`📧 E-mail pendente: "${subject}"`, ''];
+    const lines = [`📧 E-mail pendente: "${subject}"`, `Referência de reconciliação: ${failure.error?.dispatchId || dispatch.dispatchId || 'indisponível'}`, ''];
     items.forEach(item => {
         const obs = item.obs && item.obs !== 'Sem instrução — clique para editar' ? ` — ${item.obs}` : '';
         lines.push(`• ${item.cnj}${obs}`);
@@ -2740,7 +2846,8 @@ async function sendMailboxEntry(queueKey, callbacks = {}) {
         : (subjectInput ? subjectInput.value.trim() : '');
     const dispatches = createEmailDispatches(queueKey, data, subjectOverride).map(dispatch => ({
         ...dispatch,
-        queueKey: queueKey
+        queueKey: queueKey,
+        deliveryKeys: createDeliveryKeys(queueKey, dispatch)
     }));
     const result = { sent: 0, duplicates: 0, failed: [] };
 
@@ -2750,10 +2857,13 @@ async function sendMailboxEntry(queueKey, callbacks = {}) {
             const responseData = await postEmailDispatch(dispatch, (attempt, maxAttempts) => {
                 if (callbacks.onDispatchAttempt) callbacks.onDispatchAttempt(dispatch, attempt, maxAttempts);
             });
+            if (Number.isInteger(Number(responseData.queueRevision))) emailQueueRevision = Number(responseData.queueRevision);
             dispatch.items.forEach(item => saveDelegationInfo(item.cnj, [data.name], item.obs || ''));
             saveToHistory(dispatch.to, data.name, dispatch.items, dispatch.subject);
             logDelegationToSheets(dispatch.to, data.name, dispatch.items, itemsToSimpleText(dispatch.items));
             removeDispatchedItems(queueKey, dispatch.items);
+            // O backend remove os itens da FilaEmail na mesma execução que grava
+            // SENT no ledger. Aqui atualizamos apenas o cache visual/local.
             saveDelegationQueue({ syncToSheets: false });
             result.sent++;
             if (responseData.duplicate) result.duplicates++;
@@ -2890,14 +3000,15 @@ function downloadBase64File(dataUrl, filename) {
 function logDelegationToSheets(email, name, items, emailText) {
     if (!CONFIG.APPS_SCRIPT_URL) return;
     
-    const cnjs = items.map(i => i.cnj);
+    const publications = items.map(i => ({ cnj: i.cnj, idPublicacao: i.idPublicacao || '' }));
     
     fetch(CONFIG.APPS_SCRIPT_URL, {
         method: 'POST',
         headers: { 'Content-Type': 'text/plain' },
         body: JSON.stringify({
             action: 'logDelegation',
-            cnjs: cnjs,
+            publications: publications,
+            cnjs: publications.map(item => item.cnj),
             destinatario: name,
             emailTexto: emailText.substring(0, 500)
         })
