@@ -31,6 +31,9 @@
                     <i data-lucide="inbox"></i> Fila de E-mails
                     <span id="mailbox-badge" style="display:none; position: absolute; top: -8px; right: -8px; background: #ef4444; color: white; width: 22px; height: 22px; border-radius: 50%; font-size: 11px; align-items: center; justify-content: center; font-weight: 700;">0</span>
                 </button>
+                <button class="header-action-btn" onclick="fetchPublications()" title="Atualizar publicações agora">
+                    <i data-lucide="refresh-cw"></i> Atualizar
+                </button>
                 <div class="sync-status" id="sync-status">
                     <i data-lucide="wifi" class="sync-icon"></i>
                     <span>Conectado</span>
@@ -356,7 +359,7 @@
     </div>
     <div class="history-overlay hidden" id="history-overlay" onclick="toggleHistoryPanel()"></div>
 
-    <script src="script.js?v=8"></script>
+    <script src="script.js?v=9"></script>
     <script>lucide.createIcons();</script>
 </body>
 </html>

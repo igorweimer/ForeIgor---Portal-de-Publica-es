@@ -12,7 +12,7 @@ const CONFIG = {
     SHEET_ID: '1qwX3VE34d0C6lD68x00Jj09Un9Rnwh2qOninaOA9Bww',
     SHEET_GID: '1744303682',
     PER_PAGE_DEFAULT: 25,
-    REFRESH_INTERVAL: 60 * 1000, // 60 segundos — menos interrupções ao trabalhar
+    REFRESH_INTERVAL: 5 * 60 * 1000, // Evita reler o histórico inteiro a cada minuto
 };
 
 // Bruna e Mirelle recebem sempre um e-mail separado por publicação, mesmo
@@ -225,25 +225,10 @@ function fetchPublications() {
 
 async function fetchPublicationsOnce() {
     const startedAt = Date.now();
-    // Se o usuário está interagindo (lendo publicação, mailbox, editando),
-    // atualiza os dados em memória mas NÃO toca no DOM — zero flicker.
+    // Durante a interação, manter a lista e seus filtros consistentes.
+    // Uma nova cópia do histórico inteiro duplicaria o uso de memória.
     if (isUserBusy()) {
-        try {
-            const cacheBust = `?t=${Date.now()}`;
-            const fetchStartedAt = Date.now();
-            const response = await fetch(CONFIG.APPS_SCRIPT_URL + cacheBust);
-            const fetchMs = Date.now() - fetchStartedAt;
-            if (response && response.ok === false) throw new Error(`HTTP ${response.status}`);
-            const parseStartedAt = Date.now();
-            const data = await response.json();
-            const parseMs = Date.now() - parseStartedAt;
-            const normalizeStartedAt = Date.now();
-            allPublications = data.map(normalizePublication);
-            const normalizeMs = Date.now() - normalizeStartedAt;
-            detectNewPublications();
-            setSyncStatus('ok', 'Conectado');
-            console.info(`[Sync] busy rows=${allPublications.length} fetch=${fetchMs}ms parse=${parseMs}ms normalize=${normalizeMs}ms total=${Date.now() - startedAt}ms`);
-        } catch(e) { console.warn('[Sync] Atualização durante interação falhou:', e.message); }
+        console.info('[Sync] Atualização adiada durante a interação.');
         return;
     }
 
@@ -526,7 +511,6 @@ async function fetchViaGoogleViz() {
             finalStatus = (lockedStatuses[_uid] || lockedStatuses[_legacyUid]).status;
             if (!lockedStatuses[_uid] && lockedStatuses[_legacyUid]) {
                 lockedStatuses[_uid] = lockedStatuses[_legacyUid];
-                saveLockedStatuses();
             }
         }
         // 2. OPTIMISTIC: mudança local ainda não confirmada pelo servidor
@@ -537,18 +521,8 @@ async function fetchViaGoogleViz() {
         else {
             if (rawStatus === 'LIDO' || rawStatus === 'LIDA') {
                 finalStatus = 'LIDO';
-                // Auto-travar: planilha confirmou LIDO → proteger localmente
-                if (!lockedStatuses[_uid]) {
-                    lockedStatuses[_uid] = { status: 'LIDO', cnj: cnjStr2, lockedAt: Date.now() };
-                    saveLockedStatuses();
-                }
             } else if (rawStatus === 'DESCONSIDERADO' || rawStatus === 'IGNORADO') {
                 finalStatus = 'DESCONSIDERADO';
-                // Auto-travar: planilha confirmou DESCONSIDERADO → proteger localmente
-                if (!lockedStatuses[_uid]) {
-                    lockedStatuses[_uid] = { status: 'DESCONSIDERADO', cnj: cnjStr2, lockedAt: Date.now() };
-                    saveLockedStatuses();
-                }
             } else if (rawStatus === 'NÃO LIDO' || rawStatus === 'NAO LIDO' || rawStatus === 'NÃO LIDA' || rawStatus === 'NAO LIDA') {
                 finalStatus = 'NÃO LIDO';
             } else {
@@ -731,7 +705,6 @@ function normalizePublication(row) {
         finalStatus = (lockedStatuses[_uid] || lockedStatuses[_legacyUid]).status;
         if (!lockedStatuses[_uid] && lockedStatuses[_legacyUid]) {
             lockedStatuses[_uid] = lockedStatuses[_legacyUid];
-            saveLockedStatuses();
         }
     }
     // 2. OPTIMISTIC: mudança local ainda não confirmada pelo servidor
@@ -742,18 +715,8 @@ function normalizePublication(row) {
     else {
         if (rawStatus === 'LIDO' || rawStatus === 'LIDA') {
             finalStatus = 'LIDO';
-            // Auto-travar: planilha confirmou LIDO → proteger localmente
-            if (!lockedStatuses[_uid]) {
-                lockedStatuses[_uid] = { status: 'LIDO', cnj: _cnjNorm, lockedAt: Date.now() };
-                saveLockedStatuses();
-            }
         } else if (rawStatus === 'DESCONSIDERADO' || rawStatus === 'IGNORADO') {
             finalStatus = 'DESCONSIDERADO';
-            // Auto-travar: planilha confirmou DESCONSIDERADO → proteger localmente
-            if (!lockedStatuses[_uid]) {
-                lockedStatuses[_uid] = { status: 'DESCONSIDERADO', cnj: _cnjNorm, lockedAt: Date.now() };
-                saveLockedStatuses();
-            }
         } else if (rawStatus === 'NÃO LIDO' || rawStatus === 'NAO LIDO' || rawStatus === 'NÃO LIDA' || rawStatus === 'NAO LIDA') {
             finalStatus = 'NÃO LIDO';
         } else {
@@ -763,7 +726,7 @@ function normalizePublication(row) {
     return {
         _uid: _uid,
         _legacyUid: _legacyUid,
-        _deliveryUid: createStablePublicationUid(idPubRaw, _cnjNorm, dataStr, row['Tipo Publicação Tribunal'] || row.tipoPublicacao || '', textoPub),
+        _deliveryUid: _uid,
         dataDisponibilizacao: dataStr,
         dataStr: dataStr,
         cnj: cnj,
